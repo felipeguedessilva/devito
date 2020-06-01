@@ -52,6 +52,34 @@ model_type = {
 }
 
 
+def run_op(solver, operator, autotune, **options):
+    """
+    Initialize any necessary input and run the operator associated with the solver.
+    """
+    # Get the operator if exist
+    try:
+        op = getattr(solver, operator)
+    except AttributeError:
+        raise AttributeError("Operator %s not implemented for %s" % (operator, solver))
+
+    # THis is a bit ugly but not sure how to make clean input creation for different op
+    if operator == "forward":
+        return op(autotune=autotune, **options)
+    elif operator == "adjoint":
+        rec = solver.geometry.rec
+        rec.data[:] = np.random.rand(*rec.shape)
+        return op(rec, autotune=autotune, **options)
+    elif operator == "born":
+        dm = np.random.rand(solver.model.vp.shape)
+        return op(dm, autotune=autotune, **options)
+    elif operator == "gradient":
+        # I think we want the forward + gradient call, need to merge retvals
+        rec, u, _ = solver.forward(autotune=autotune, **options)
+        return op(rec, u, autotune=autotune, **options)
+    else:
+        raise ValueError("Unrecognized operator %s" % operator)
+
+
 @click.group()
 def benchmark():
     """
@@ -224,15 +252,7 @@ def run(problem, **kwargs):
                 options['%s%d_blk%d_size' % (d, i, n)] = s
 
     solver = setup(space_order=space_order, time_order=time_order, **kwargs)
-    # Get forward wavefield if rrunning gradient
-    try:
-        if operator == "gradient":
-            u = solver.forward(autotune=autotune, **options)[1]
-            retval = getattr(solver, operator)(u, autotune=autotune, **options)
-        else:
-            retval = getattr(solver, operator)(autotune=autotune, **options)
-    except AttributeError:
-        raise AttributeError("Operator %s not implemented for %s" % (operator, problem))
+    retval = run_op(solver, operator, autotune, **options)
 
     try:
         rank = MPI.COMM_WORLD.rank
