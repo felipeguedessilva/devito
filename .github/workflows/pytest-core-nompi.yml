@@ -1,5 +1,9 @@
 name: CI-core
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   # Trigger the workflow on push or pull request,
   # but only for the master branch
@@ -153,7 +157,7 @@ jobs:
       if: "!contains(matrix.name, 'docker')"
       run: |
         pip install --upgrade pip
-        pip install -e .
+        pip install -e .[tests]
         pip install sympy==${{matrix.sympy}}
 
     - name: Test with pytest

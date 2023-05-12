@@ -182,7 +182,7 @@ class TestStreaming(object):
         exprs = FindNodes(Expression).visit(op._func_table['copy_to_host0'].root)
         b = 13 if configuration['language'] == 'openacc' else 12  # No `qid` w/ OMP
         assert str(exprs[b]) == 'const int deviceid = sdata->deviceid;'
-        assert str(exprs[b+1]) == 'int time = sdata->time;'
+        assert str(exprs[b+1]) == 'volatile int time = sdata->time;'
         assert str(exprs[b+2]) == 'lock0[0] = 1;'
         assert exprs[b+3].write is u
         assert exprs[b+4].write is v
@@ -1127,6 +1127,86 @@ class TestStreaming(object):
         op.apply(time_M=nt-1)
 
         assert np.all(g.data == 30)
+
+    @skipif('device-openmp')
+    def test_gpu_create_forward(self):
+        nt = 10
+        grid = Grid(shape=(4, 4))
+
+        u = TimeFunction(name='u', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, save=nt)
+
+        for i in range(nt):
+            usave.data[i, :] = i
+
+        eqn = Eq(u.forward, u + usave)
+
+        op = Operator(eqn,
+                      opt=('buffering', 'streaming', 'orchestrate', {'gpu-create': u}))
+
+        # print(op)
+        # assert False
+
+        # language = configuration['language']
+        # if language == 'openacc':
+        #     assert 'create(u' in str(op)
+        # elif language == 'openmp':
+        #     assert 'map(alloc: u' in str(op)
+        # assert 'init0(u_vec' in str(op)
+
+        op.apply(time_M=nt - 2)
+
+        assert np.all(u.data[0] == 28)
+        assert np.all(u.data[1] == 36)
+
+    @skipif('device-openmp')
+    def test_gpu_create_backward(self):
+        nt = 10
+        grid = Grid(shape=(4, 4))
+
+        u = TimeFunction(name='u', grid=grid)
+        usave = TimeFunction(name='usave', grid=grid, save=nt)
+
+        for i in range(nt):
+            usave.data[i, :] = i
+
+        eqn = Eq(u.backward, u + usave)
+
+        op = Operator(eqn,
+                      opt=('buffering', 'streaming', 'orchestrate', {'gpu-create': u}))
+
+        language = configuration['language']
+        if language == 'openacc':
+            assert 'create(u' in str(op)
+        elif language == 'openmp':
+            assert 'map(alloc: u' in str(op)
+        assert 'init0(u_vec' in str(op)
+
+        op.apply(time_M=nt - 2)
+
+        assert np.all(u.data[0] == 36)
+        assert np.all(u.data[1] == 35)
+
+    def test_place_transfers(self):
+        grid = Grid(shape=(4, 4))
+
+        u = TimeFunction(name='u', grid=grid)
+
+        eqn = Eq(u.forward, u + 1)
+
+        op = Operator(eqn,
+                      opt=('buffering', 'streaming', 'orchestrate',
+                           {'place-transfers': False}))
+
+        language = configuration['language']
+        if language == 'openacc':
+            assert 'copyin(u' not in str(op)
+            assert 'copyout(u' not in str(op)
+            assert 'delete(u' not in str(op)
+        elif language == 'openmp':
+            assert 'map(to: u' not in str(op)
+            assert 'update from(u' not in str(op)
+            assert 'map(release: u' not in str(op)
 
 
 class TestAPI(object):

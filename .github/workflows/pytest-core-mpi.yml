@@ -1,5 +1,9 @@
 name: CI-mpi
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   # Trigger the workflow on push or pull request,
   # but only for the master branch
@@ -36,7 +40,7 @@ jobs:
       run: |
         sudo apt-get update && sudo apt install mpich -y
         pip3 install --upgrade pip
-        pip3 install -e .[extras,mpi]
+        pip3 install -e .[extras,mpi,tests]
 
     - name: Test with pytest
       run: |

@@ -8,6 +8,7 @@ from devito.logger import perf, warning as _warning
 from devito.mpi.distributed import MPI, MPINeighborhood
 from devito.mpi.routines import MPIMsgEnriched
 from devito.parameters import configuration
+from devito.symbolics import normalize_args
 from devito.tools import filter_ordered, flatten, is_integer, prod
 from devito.types import Timer
 
@@ -258,7 +259,12 @@ def finalize_time_bounds(stepper, at_args, args, mode):
 def calculate_nblocks(tree, blockable):
     block_indices = [n for n, i in enumerate(tree) if i.dim in blockable]
     index = block_indices[0]
-    collapsed = tree[index:index + (tree[index].ncollapsed or index+1)]
+    try:
+        ncollapsed = tree[index].ncollapsed
+    except AttributeError:
+        # Not using OpenMP
+        ncollapsed = 0
+    collapsed = tree[index:index + (ncollapsed or index+1)]
     blocked = [i.dim for i in collapsed if i.dim in blockable]
     remainders = [(d.root.symbolic_max-d.root.symbolic_min+1) % d.step for d in blocked]
     niters = [d.root.symbolic_max - i for d, i in zip(blocked, remainders)]
@@ -268,6 +274,8 @@ def calculate_nblocks(tree, blockable):
 
 
 def generate_block_shapes(blockable, args, level):
+    args = normalize_args(args)
+
     if not blockable:
         raise ValueError
 

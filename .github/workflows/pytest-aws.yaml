@@ -1,5 +1,9 @@
 name: aws-ci
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   # Trigger the workflow on push or pull request,
   # but only for the master branch
@@ -66,7 +70,7 @@ jobs:
       if: "!contains(matrix.name, 'docker')"
       run: |
         pip3 install --upgrade pip
-        pip3 install -U -e .
+        pip3 install -U -e .[tests]
         pip3 install pytest-xdist
   
     - name: Test with pytest
