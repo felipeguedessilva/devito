@@ -20,7 +20,7 @@ from devito.operator.registry import operator_selector
 from devito.mpi import MPI
 from devito.parameters import configuration
 from devito.passes import (Graph, lower_index_derivatives, generate_implicit,
-                           generate_macros, unevaluate)
+                           generate_macros, minimize_symbols, unevaluate)
 from devito.symbolics import estimate_cost
 from devito.tools import (DAG, OrderedSet, Signer, ReducerMap, as_tuple, flatten,
                           filter_sorted, frozendict, is_integer, split, timed_pass,
@@ -194,6 +194,7 @@ class Operator(Callable):
 
         # Required for the jit-compilation
         op._compiler = kwargs['compiler']
+        op._language = kwargs['language']
         op._lib = None
         op._cfunction = None
 
@@ -457,6 +458,9 @@ class Operator(Callable):
 
         # Extract the necessary macros from the symbolic objects
         generate_macros(graph)
+
+        # Target-independent optimizations
+        minimize_symbols(graph)
 
         return graph.root, graph
 
@@ -1035,6 +1039,8 @@ class ArgumentsMap(dict):
 
         self.allocator = op._allocator
         self.platform = op._platform
+        self.language = op._language
+        self.compiler = op._compiler
         self.options = op._options
 
     @property
