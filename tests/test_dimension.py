@@ -9,7 +9,7 @@ from devito import (ConditionalDimension, Grid, Function, TimeFunction, floor,  
                     SparseFunction, SparseTimeFunction, Eq, Operator, Constant,
                     Dimension, DefaultDimension, SubDimension, switchconfig,
                     SubDomain, Lt, Le, Gt, Ge, Ne, Buffer, sin, SpaceDimension,
-                    CustomDimension, dimensions, configuration)
+                    CustomDimension, dimensions, configuration, norm, Inc, sum)
 from devito.ir.iet import (Conditional, Expression, Iteration, FindNodes,
                            FindSymbols, retrieve_iteration_tree)
 from devito.symbolics import indexify, retrieve_functions, IntDiv, INT
@@ -243,6 +243,10 @@ class TestSubDimension(object):
         xi = SubDimension.middle(name='xi', parent=x,
                                  thickness_left=1,
                                  thickness_right=1)
+        assert xi.is_middle
+        assert not xi.is_left
+        assert not xi.is_right
+
         eqs = [Eq(u.forward, u + 1)]
         eqs = [e.subs(x, xi) for e in eqs]
 
@@ -261,6 +265,8 @@ class TestSubDimension(object):
         thickness = 4
 
         xleft = SubDimension.left(name='xleft', parent=x, thickness=thickness)
+        assert xleft.is_left
+        assert not xleft.is_middle
         assert xleft.symbolic_size == xleft.thickness.left[0]
 
         xi = SubDimension.middle(name='xi', parent=x,
@@ -289,7 +295,8 @@ class TestSubDimension(object):
         xi = SubDimension.middle(name='xi', parent=x,
                                  thickness_left=thickness, thickness_right=thickness)
         xright = SubDimension.right(name='xright', parent=x, thickness=thickness)
-
+        assert xright.is_right
+        assert not xright.is_middle
         yi = SubDimension.middle(name='yi', parent=y,
                                  thickness_left=thickness, thickness_right=thickness)
 
@@ -1515,7 +1522,7 @@ class TestConditionalDimension(object):
 
         op = Operator(Eq(f, 1))
 
-        assert op.arguments()['time_M'] == 4*(save-1)  # == min legal endpoint
+        assert op.arguments()['time_M'] == 4*save-1  # == min legal endpoint
 
         # Also no issues when supplying an override
         assert op.arguments(time_M=10)['time_M'] == 10
@@ -1530,7 +1537,6 @@ class TestConditionalDimension(object):
         i = Dimension(name='i')
 
         ci = ConditionalDimension(name='ci', parent=i, factor=factor)
-
         g = Function(name='g', shape=(size,), dimensions=(i,))
         f = Function(name='f', shape=(int(size/factor),), dimensions=(ci,))
 
@@ -1629,6 +1635,25 @@ class TestConditionalDimension(object):
         op = Operator(eqns, opt=('advanced', {'openmp': True}))
 
         assert_structure(op, ['i,x,y', 'i', 'i,x,y', 'i,x,y'], 'i,x,y,x,y,x,y')
+
+    def test_cond_notime(self):
+        grid = Grid(shape=(10, 10))
+        time = grid.time_dim
+
+        time_under = ConditionalDimension(name='timeu', parent=time, factor=5)
+        nt = 10
+
+        u = TimeFunction(name='u', grid=grid, space_order=2)
+        usaved = TimeFunction(name='usaved', grid=grid, space_order=2,
+                              time_dim=time_under, save=nt//5+1)
+        g = Function(name='g', grid=grid)
+
+        op = Operator([Eq(usaved, u)])
+        op(time_m=1, time_M=nt-1, dt=1)
+
+        op = Operator([Inc(g, usaved)])
+        op(time_m=1, time_M=nt-1, dt=1)
+        assert norm(g, order=1) == norm(sum(usaved, dims=time_under), order=1)
 
 
 class TestCustomDimension(object):
