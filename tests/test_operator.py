@@ -521,7 +521,7 @@ class TestArithmetic(object):
         Test injection of a SparseFunction into a Function
         """
         grid = Grid(shape=(11, 11))
-        u = Function(name='u', grid=grid, space_order=0)
+        u = Function(name='u', grid=grid, space_order=1)
 
         sf1 = SparseFunction(name='s', grid=grid, npoint=1)
         op = Operator(sf1.inject(u, expr=sf1))
@@ -542,7 +542,7 @@ class TestArithmetic(object):
         Test interpolation of a SparseFunction from a Function
         """
         grid = Grid(shape=(11, 11))
-        u = Function(name='u', grid=grid, space_order=0)
+        u = Function(name='u', grid=grid, space_order=1)
 
         sf1 = SparseFunction(name='s', grid=grid, npoint=1)
         op = Operator(sf1.interpolate(u))
@@ -563,7 +563,7 @@ class TestArithmetic(object):
         Test injection of a SparseTimeFunction into a TimeFunction
         """
         grid = Grid(shape=(11, 11))
-        u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=0)
+        u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=1)
 
         sf1 = SparseTimeFunction(name='s', grid=grid, npoint=1, nt=5)
         op = Operator(sf1.interpolate(u))
@@ -586,7 +586,7 @@ class TestArithmetic(object):
         Test injection of a SparseTimeFunction from a TimeFunction
         """
         grid = Grid(shape=(11, 11))
-        u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=0)
+        u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=1)
 
         sf1 = SparseTimeFunction(name='s', grid=grid, npoint=1, nt=5)
         op = Operator(sf1.inject(u, expr=3*sf1))
@@ -611,7 +611,7 @@ class TestArithmetic(object):
         Test injection of the time deivative of a SparseTimeFunction into a TimeFunction
         """
         grid = Grid(shape=(11, 11))
-        u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=0)
+        u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=1)
 
         sf1 = SparseTimeFunction(name='s', grid=grid, npoint=1, nt=5, time_order=2)
 
@@ -1935,6 +1935,58 @@ class TestLoopScheduling(object):
         op = Operator(eqns)
 
         assert_structure(op, ['r,i', 'r'], 'r,i')
+
+    @pytest.mark.parametrize('eqns, expected, exp_trees, exp_iters', [
+        (['Eq(u[0, x], 1)',
+            'Eq(u[1, x], u[0, x + h_x] + u[0, x - h_x] - 2*u[0, x])'],
+            np.array([[1., 1., 1.], [-1., 0., -1.]]),
+            ['x', 'x'], 'x,x')
+    ])
+    def test_2194(self, eqns, expected, exp_trees, exp_iters):
+        grid = Grid(shape=(3, ))
+        u = TimeFunction(name='u', grid=grid)
+        x = grid.dimensions[0]
+        h_x = x.spacing  # noqa: F841
+
+        for i, e in enumerate(list(eqns)):
+            eqns[i] = eval(e)
+
+        op = Operator(eqns)
+        assert_structure(op, exp_trees, exp_iters)
+
+        op.apply()
+        assert(np.all(u.data[:] == expected[:]))
+
+    @pytest.mark.parametrize('eqns, expected, exp_trees, exp_iters', [
+        (['Eq(u[0, y], 1)', 'Eq(u[1, y], u[0, y + 1])'],
+            np.array([[1., 1.], [1., 0.]]),
+            ['y', 'y'], 'y,y'),
+        (['Eq(u[0, y], 1)', 'Eq(u[1, y], u[0, 2])'],
+            np.array([[1., 1.], [0., 0.]]),
+            ['y', 'y'], 'y,y'),
+        (['Eq(u[0, y], 1)', 'Eq(u[1, y], u[0, 1])'],
+            np.array([[1., 1.], [1., 1.]]),
+            ['y', 'y'], 'y,y'),
+        (['Eq(u[0, y], 1)', 'Eq(u[1, y], u[0, y + 1])'],
+            np.array([[1., 1.], [1., 0.]]),
+            ['y', 'y'], 'y,y'),
+        (['Eq(u[0, 1], 1)', 'Eq(u[x, y], u[0, y])'],
+            np.array([[0., 1.], [0., 1.]]),
+            ['xy'], 'x,y')
+    ])
+    def test_2194_v2(self, eqns, expected, exp_trees, exp_iters):
+        grid = Grid(shape=(2, 2))
+        u = Function(name='u', grid=grid)
+        x, y = grid.dimensions
+
+        for i, e in enumerate(list(eqns)):
+            eqns[i] = eval(e)
+
+        op = Operator(eqns)
+        assert_structure(op, exp_trees, exp_iters)
+
+        op.apply()
+        assert(np.all(u.data[:] == expected[:]))
 
 
 class TestInternals(object):

@@ -1501,7 +1501,7 @@ class TestOperatorAdvanced(object):
         """
         grid = Grid(shape=(4, 4), extent=(3.0, 3.0))
 
-        f = Function(name='f', grid=grid, space_order=0)
+        f = Function(name='f', grid=grid, space_order=1)
         f.data[:] = 0.
         coords = np.array([(0.5, 0.5), (0.5, 2.5), (2.5, 0.5), (2.5, 2.5)])
         sf = SparseFunction(name='sf', grid=grid, npoint=len(coords), coordinates=coords)
@@ -1536,7 +1536,7 @@ class TestOperatorAdvanced(object):
         grid = Grid(shape=(4, 4), extent=(3.0, 3.0))
 
         save = 3
-        f = TimeFunction(name='f', grid=grid, save=save, space_order=0)
+        f = TimeFunction(name='f', grid=grid, save=save, space_order=1)
         f.data[:] = 0.
         coords = np.array([(0.5, 0.5), (0.5, 2.5), (2.5, 0.5), (2.5, 2.5)])
         sf = SparseTimeFunction(name='sf', grid=grid, nt=save,
@@ -1611,7 +1611,7 @@ class TestOperatorAdvanced(object):
     def test_interpolation_wodup(self):
         grid = Grid(shape=(4, 4), extent=(3.0, 3.0))
 
-        f = Function(name='f', grid=grid, space_order=0)
+        f = Function(name='f', grid=grid, space_order=1)
         f.data[:] = 4.
         coords = [(0.5, 0.5), (0.5, 2.5), (2.5, 0.5), (2.5, 2.5)]
         sf = SparseFunction(name='sf', grid=grid, npoint=len(coords), coordinates=coords)
@@ -2108,7 +2108,8 @@ class TestOperatorAdvanced(object):
         eqn = Eq(u.forward, _R(_R(u[t, x, y] + u[t, x+1, y+1])*3.*f +
                                _R(u[t, x+2, y+2] + u[t, x+3, y+3])*3.*f) + 1.)
         op0 = Operator(eqn, opt='noop')
-        op1 = Operator(eqn, opt=('advanced', {'cire-mingain': 0}))
+        op1 = Operator(eqn, opt=('advanced', {'cire-mingain': 0,
+                                              'cire-schedule': 1}))
 
         assert len([i for i in FindSymbols().visit(op1.body) if i.is_Array]) == 1
 
@@ -2141,7 +2142,8 @@ class TestOperatorAdvanced(object):
         eqn = Eq(u.forward, _R(_R(u[t, x, y] + u[t, x+2, y])*3.*f +
                                _R(u[t, x+1, y+1] + u[t, x+3, y+1])*3.*f) + 1.)
         op0 = Operator(eqn, opt='noop')
-        op1 = Operator(eqn, opt=('advanced', {'cire-mingain': 0}))
+        op1 = Operator(eqn, opt=('advanced', {'cire-mingain': 0,
+                                              'cire-schedule': 1}))
 
         assert len([i for i in FindSymbols().visit(op1.body) if i.is_Array]) == 1
 
@@ -2499,10 +2501,8 @@ class TestIsotropicAcoustic(object):
         op_adj = solver.op_adj()
         adj_calls = FindNodes(Call).visit(op_adj)
 
-        # one halo, ndim memalign and free (pos temp rec/src)
-        sf_calls = 2 * len(shape)
-        assert len(fwd_calls) == 1 + sf_calls
-        assert len(adj_calls) == 1 + sf_calls
+        assert len(fwd_calls) == 1
+        assert len(adj_calls) == 1
 
     def run_adjoint_F(self, nd):
         """

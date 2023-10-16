@@ -338,11 +338,11 @@ class AbstractSparseFunction(DiscreteFunction):
                                   condition=condition, indirect=True)
 
         if expr is None:
-            out = self.indexify().xreplace({self._sparse_dim: cd})
+            out = self.indexify()._subs(self._sparse_dim, cd)
         else:
             functions = {f for f in retrieve_function_carriers(expr)
                          if f.is_SparseFunction}
-            out = indexify(expr).xreplace({f._sparse_dim: cd for f in functions})
+            out = indexify(expr).subs({f._sparse_dim: cd for f in functions})
 
         return out, temps
 
@@ -1008,6 +1008,8 @@ class PrecomputedSparseFunction(AbstractSparseFunction):
     uses `*args` to (re-)create the Dimension arguments of the symbolic object.
     """
 
+    is_SparseFunction = True
+
     _sub_functions = ('gridpoints', 'coordinates', 'interpolation_coeffs')
 
     __rkwargs__ = (AbstractSparseFunction.__rkwargs__ +
@@ -1172,6 +1174,8 @@ class PrecomputedSparseTimeFunction(AbstractSparseTimeFunction,
     The parameters must always be given as keyword arguments, since SymPy
     uses ``*args`` to (re-)create the Dimension arguments of the symbolic object.
     """
+
+    is_SparseTimeFunction = True
 
     __rkwargs__ = tuple(filter_ordered(AbstractSparseTimeFunction.__rkwargs__ +
                                        PrecomputedSparseFunction.__rkwargs__))
