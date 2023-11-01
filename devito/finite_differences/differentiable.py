@@ -105,7 +105,16 @@ class Differentiable(sympy.Expr, Evaluable):
 
     @cached_property
     def _fd(self):
-        return dict(ChainMap(*[getattr(i, '_fd', {}) for i in self._args_diff]))
+        # Filter out all args with fd order too high
+        fd_args = []
+        for f in self._args_diff:
+            try:
+                if f.space_order <= self.space_order and \
+                        (not f.is_TimeDependent or f.time_order <= self.time_order):
+                    fd_args.append(f)
+            except AttributeError:
+                pass
+        return dict(ChainMap(*[getattr(i, '_fd', {}) for i in fd_args]))
 
     @cached_property
     def _symbolic_functions(self):
@@ -114,6 +123,13 @@ class Differentiable(sympy.Expr, Evaluable):
     @cached_property
     def _uses_symbolic_coefficients(self):
         return bool(self._symbolic_functions)
+
+    @cached_property
+    def _coeff_symbol(self, *args, **kwargs):
+        if self._uses_symbolic_coefficients:
+            return W
+        else:
+            raise ValueError("Couldn't find any symbolic coefficients")
 
     def _eval_at(self, func):
         if not func.is_Staggered:
@@ -325,6 +341,10 @@ class Differentiable(sympy.Expr, Evaluable):
 def highest_priority(DiffOp):
     prio = lambda x: getattr(x, '_fd_priority', 0)
     return sorted(DiffOp._args_diff, key=prio, reverse=True)[0]
+
+
+# Abstract symbol representing a symbolic coefficient
+W = sympy.Function('W')
 
 
 class DifferentiableOp(Differentiable):
@@ -606,12 +626,13 @@ class Weights(Array):
         assert isinstance(d, StencilDimension) and d.symbolic_size == len(weights)
         assert isinstance(weights, (list, tuple, np.ndarray))
 
-        try:
-            self._spacings = set().union(*[i.find(Spacing) for i in weights])
-        except AttributeError:
-            self._spacing = set()
+        # Normalize `weights`
+        weights = tuple(sympy.sympify(i) for i in weights)
+
+        self._spacings = set().union(*[i.find(Spacing) for i in weights])
 
         kwargs['scope'] = 'constant'
+        kwargs['initvalue'] = weights
 
         super().__init_finalize__(*args, **kwargs)
 
@@ -636,6 +657,21 @@ class Weights(Array):
         return self._spacings
 
     weights = Array.initvalue
+
+    def _xreplace(self, rule):
+        if self in rule:
+            return rule[self], True
+        elif not rule:
+            return self, False
+        else:
+            try:
+                weights, flags = zip(*[i._xreplace(rule) for i in self.weights])
+                if any(flags):
+                    return self.func(initvalue=weights, function=None), True
+            except AttributeError:
+                # `float` weights
+                pass
+            return super()._xreplace(rule)
 
 
 class IndexDerivative(IndexSum):
@@ -711,6 +747,7 @@ class IndexDerivative(IndexSum):
         return expr
 
 
+# SymPy args ordering is the same for Derivatives and IndexDerivatives
 ordering_of_classes.insert(ordering_of_classes.index('Derivative') + 1,
                            'IndexDerivative')
 
@@ -749,9 +786,6 @@ class EvalDerivative(DifferentiableOp, sympy.Add):
     def _new_rawargs(self, *args, **kwargs):
         kwargs.pop('is_commutative', None)
         return self.func(*args, **kwargs)
-
-    def _coeff_symbol(self, *args, **kwargs):
-        return self.base._coeff_symbol(*args, **kwargs)
 
 
 class diffify(object):
