@@ -35,6 +35,7 @@ class TestDistributor(object):
         }
         assert f.shape == expected[distributor.nprocs][distributor.myrank]
         assert f.size_global == 225
+        assert distributor.nprocs_local == distributor.nprocs
 
     @pytest.mark.parallel(mode=[2, 4])
     def test_partitioning_fewer_dims(self):
@@ -418,6 +419,21 @@ class TestFunction(object):
 
         assert all(i == slice(*j)
                    for i, j in zip(f.local_indices, expected[grid.distributor.myrank]))
+
+    @pytest.mark.parallel(mode=4)
+    @pytest.mark.parametrize('shape', [(1,), (2, 3), (4, 5, 6)])
+    def test_mpi4py_nodevmpi(self, shape):
+
+        with switchconfig(mpi=False):
+            # Mimic external mpi init
+            MPI.Init()
+            # Check that internal Function work correctly
+            grid = Grid(shape=shape)
+            f = Function(name="f", grid=grid, space_order=1)
+            assert f.data.shape == shape
+            assert f.data_with_halo.shape == tuple(s+2 for s in shape)
+            assert f.data._local.shape == shape
+            MPI.Finalize()
 
 
 class TestSparseFunction(object):

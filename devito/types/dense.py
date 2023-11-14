@@ -741,7 +741,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
     def _halo_exchange(self):
         """Perform the halo exchange with the neighboring processes."""
-        if not MPI.Is_initialized() or MPI.COMM_WORLD.size == 1:
+        if not MPI.Is_initialized() or MPI.COMM_WORLD.size == 1 or \
+                not configuration['mpi']:
             # Nothing to do
             return
         if MPI.COMM_WORLD.size > 1 and self._distributor is None:
@@ -792,8 +793,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         args = ReducerMap({key.name: self._data_buffer})
 
         # Collect default dimension arguments from all indices
-        for i, s in zip(self.dimensions, self.shape):
-            args.update(i._arg_defaults(_min=0, size=s))
+        for a, i, s in zip(key.dimensions, self.dimensions, self.shape):
+            args.update(i._arg_defaults(_min=0, size=s, alias=a))
 
         return args
 
