@@ -781,10 +781,10 @@ def optimize_schedule_rotations(schedule, sregistry):
         iis = candidate.lower
         iib = candidate.upper
 
-        ii = ModuloDimension('%sii' % d, ds, iis, incr=iib)
-        cd = CustomDimension(name='%s%s' % (d, d), symbolic_min=ii, symbolic_max=iib,
-                             symbolic_size=n)
-        dsi = ModuloDimension('%si' % ds, cd, cd + ds - iis, n)
+        ii = ModuloDimension('%sii' % d.root.name, ds, iis, incr=iib)
+        cd = CustomDimension(name='%s%s' % (d.root.name, d.root.name), symbolic_min=ii,
+                             symbolic_max=iib, symbolic_size=n)
+        dsi = ModuloDimension('%si' % ds.root.name, cd, cd + ds - iis, n)
 
         mapper = OrderedDict()
         for i in g:
@@ -795,7 +795,7 @@ def optimize_schedule_rotations(schedule, sregistry):
                 try:
                     md = mapper[v]
                 except KeyError:
-                    name = sregistry.make_name(prefix='%sr' % d.name)
+                    name = sregistry.make_name(prefix='%sr' % d.root.name)
                     md = mapper.setdefault(v, ModuloDimension(name, ds, v, n))
                 mds.append(md)
             indicess = [indices[:ridx] + [md] + indices[ridx + 1:]
@@ -922,10 +922,15 @@ def lower_schedule(schedule, meta, sregistry, ftemps):
 
         # Drop or weaken parallelism if necessary
         for d, v in meta.properties.items():
-            if any(i.is_Modulo for i in ispace.sub_iterators[d]):
-                properties[d] = normalize_properties(v, {SEQUENTIAL})
-            elif d not in writeto.itdims:
-                properties[d] = normalize_properties(v, {PARALLEL_IF_PVT}) - {ROUNDABLE}
+            try:
+                if any(i.is_Modulo for i in ispace.sub_iterators[d]):
+                    properties[d] = normalize_properties(v, {SEQUENTIAL})
+                elif d not in writeto.itdims:
+                    properties[d] = normalize_properties(v, {PARALLEL_IF_PVT}) - \
+                        {ROUNDABLE}
+            except KeyError:
+                # Non-dimension key such as (x, y) for diagonal stencil u(x+i hx, y+i hy)
+                pass
 
         # Track star-shaped stencils for potential future optimization
         if len(writeto) > 1 and schedule.is_frame:
@@ -1307,7 +1312,7 @@ ScheduledAlias = namedtuple('SchedAlias',
 class Schedule(tuple):
 
     def __new__(cls, *items, dmapper=None, rmapper=None, is_frame=False):
-        obj = super(Schedule, cls).__new__(cls, items)
+        obj = super().__new__(cls, items)
         obj.dmapper = dmapper or {}
         obj.rmapper = rmapper or {}
         obj.is_frame = is_frame

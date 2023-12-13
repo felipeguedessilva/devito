@@ -196,8 +196,7 @@ class CallFromPointer(sympy.Expr, Pickable, BasicWrapperMixin):
     __repr__ = __str__
 
     def _hashable_content(self):
-        return super(CallFromPointer, self)._hashable_content() +\
-            (self.call, self.pointer) + self.params
+        return super()._hashable_content() + (self.call, self.pointer) + self.params
 
     @property
     def base(self):
@@ -675,6 +674,14 @@ class UCHARP(CastStar):
     base = UCHAR
 
 
+class SHORTP(CastStar):
+    base = SHORT
+
+
+class USHORTP(CastStar):
+    base = USHORT
+
+
 cast_mapper = {
     np.int8: CHAR,
     np.uint8: UCHAR,
@@ -691,8 +698,8 @@ cast_mapper = {
     (np.int8, '*'): CHARP,
     (np.uint8, '*'): UCHARP,
     (int, '*'): INTP,  # noqa
-    (np.uint16, '*'): INTP,  # noqa
-    (np.int16, '*'): INTP,  # noqa
+    (np.uint16, '*'): USHORTP,  # noqa
+    (np.int16, '*'): SHORTP,  # noqa
     (np.int32, '*'): INTP,  # noqa
     (np.int64, '*'): INTP,  # noqa
     (np.float32, '*'): FLOATP,  # noqa

@@ -8,6 +8,7 @@ import numpy as np
 import sympy
 
 from sympy.core.assumptions import _assume_rules
+from sympy.core.decorators import call_highest_priority
 from cached_property import cached_property
 
 from devito.data import default_allocator
@@ -663,6 +664,22 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
             pass
         return newobj
 
+    @classmethod
+    def __subfunc_setup__(cls, *args, **kwargs):
+        """Setup each component of the tensor as a Devito type."""
+        return []
+
+    @property
+    def grid(self):
+        """
+        A Tensor is expected to have all its components defined over the same grid
+        """
+        grids = {getattr(c, 'grid', None) for c in self.flat()} - {None}
+        if len(grids) == 0:
+            return None
+        assert len(grids) == 1
+        return grids.pop()
+
     def _infer_dims(self):
         grids = {getattr(c, 'grid', None) for c in self.flat()} - {None}
         dimensions = {d for c in self.flat()
@@ -704,6 +721,15 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
         # Real valued adjoint is transpose
         return self.transpose(inner=inner)
 
+    @call_highest_priority('__radd__')
+    def __add__(self, other):
+        try:
+            # Most case support sympy add
+            return super().__add__(other)
+        except TypeError:
+            # Sympy doesn't support add with scalars
+            return self.applyfunc(lambda x: x + other)
+
     def _eval_matrix_mul(self, other):
         """
         Copy paste from sympy to avoid explicit call to sympy.Add
@@ -732,11 +758,6 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
         # Get new class and return product
         newcls = self.classof_prod(other, new_mat)
         return newcls._new(self.rows, other.cols, new_mat, copy=False)
-
-    @classmethod
-    def __subfunc_setup__(cls, *args, **kwargs):
-        """Setup each component of the tensor as a Devito type."""
-        return []
 
 
 class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
