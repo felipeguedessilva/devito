@@ -598,6 +598,14 @@ def get_platform():
 class Platform(object):
 
     registry = {}
+    """
+    The Platform registry.
+
+    Each new Platform instance is automatically added to the registry.
+    """
+
+    max_mem_trans_nbytes = None
+    """Maximum memory transaction size in bytes."""
 
     def __init__(self, name):
         self.name = name
@@ -631,16 +639,6 @@ class Platform(object):
         return self.cores_logical // self.cores_physical
 
     @property
-    def simd_reg_size(self):
-        """Size in bytes of a SIMD register."""
-        return isa_registry.get(self.isa, 0)
-
-    def simd_items_per_reg(self, dtype):
-        """Number of items of type ``dtype`` that can fit in a SIMD register."""
-        assert self.simd_reg_size % np.dtype(dtype).itemsize == 0
-        return int(self.simd_reg_size / np.dtype(dtype).itemsize)
-
-    @property
     def memtotal(self):
         """Physical memory size in bytes, or None if unknown."""
         return None
@@ -649,8 +647,22 @@ class Platform(object):
         """Available physical memory in bytes, or None if unknown."""
         return None
 
+    def max_mem_trans_size(self, dtype):
+        """
+        Number of items of type `dtype` that can be transferred in a single
+        memory transaction.
+        """
+        assert self.max_mem_trans_nbytes % np.dtype(dtype).itemsize == 0
+        return int(self.max_mem_trans_nbytes / np.dtype(dtype).itemsize)
+
 
 class Cpu64(Platform):
+
+    # The vast majority of CPUs have a 64-byte cache line size
+    max_mem_trans_nbytes = 64
+
+    # The known ISAs are to be provided by the subclasses
+    known_isas = ()
 
     def __init__(self, name, cores_logical=None, cores_physical=None, isa=None):
         super().__init__(name)
@@ -660,9 +672,6 @@ class Cpu64(Platform):
         self.cores_logical = cores_logical or cpu_info['logical']
         self.cores_physical = cores_physical or cpu_info['physical']
         self.isa = isa or self._detect_isa()
-
-    # The known ISAs are to be provided by the subclasses
-    known_isas = ()
 
     @classmethod
     def _mro(cls):
@@ -682,6 +691,20 @@ class Cpu64(Platform):
                 # appears as 'avx512f, avx512cd, ...'
                 return i
         return 'cpp'
+
+    @property
+    def simd_reg_nbytes(self):
+        """
+        Size in bytes of a SIMD register.
+        """
+        return isa_registry.get(self.isa, 0)
+
+    def simd_items_per_reg(self, dtype):
+        """
+        Number of items of type `dtype` that fit in a SIMD register.
+        """
+        assert self.simd_reg_nbytes % np.dtype(dtype).itemsize == 0
+        return int(self.simd_reg_nbytes / np.dtype(dtype).itemsize)
 
     @cached_property
     def memtotal(self):
@@ -758,7 +781,7 @@ class Device(Platform):
                 break
         return retval
 
-    @cached_property
+    @property
     def march(self):
         return None
 
@@ -783,12 +806,21 @@ class Device(Platform):
 
 class IntelDevice(Device):
 
-    @cached_property
+    max_mem_trans_nbytes = 64
+
+    def __init__(self, *args, sub_group_size=32, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.sub_group_size = sub_group_size
+
+    @property
     def march(self):
         return ''
 
 
 class NvidiaDevice(Device):
+
+    max_mem_trans_nbytes = 128
 
     @cached_property
     def march(self):
@@ -801,6 +833,8 @@ class NvidiaDevice(Device):
 
 
 class AmdDevice(Device):
+
+    max_mem_trans_nbytes = 256
 
     @cached_property
     def march(cls):
@@ -865,10 +899,10 @@ NVIDIAX = NvidiaDevice('nvidiaX')
 AMDGPUX = AmdDevice('amdgpuX')
 
 INTELGPUX = IntelDevice('intelgpuX')
-PVC = IntelDevice('pvc', max_threads_per_block=4096)  # Legacy codename for MAX GPUs
-INTELGPUMAX = IntelDevice('intelgpuMAX', max_threads_per_block=4096)
-MAX1100 = IntelDevice('max1100', max_threads_per_block=4096)
-MAX1550 = IntelDevice('max1550', max_threads_per_block=4096)
+PVC = IntelDevice('pvc')  # Legacy codename for MAX GPUs
+INTELGPUMAX = IntelDevice('intelgpuMAX')
+MAX1100 = IntelDevice('max1100')
+MAX1550 = IntelDevice('max1550')
 
 platform_registry = Platform.registry
 platform_registry['cpu64'] = get_platform  # Autodetection
