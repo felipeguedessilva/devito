@@ -11,7 +11,7 @@ from sympy.core.core import ordering_of_classes
 from sympy.core.decorators import call_highest_priority
 from sympy.core.evalf import evalf_table
 
-from devito.finite_differences.tools import make_shift_x0
+from devito.finite_differences.tools import make_shift_x0, coeff_priority
 from devito.logger import warning
 from devito.tools import (as_tuple, filter_ordered, flatten, frozendict,
                           infer_dtype, is_integer, split)
@@ -124,6 +124,14 @@ class Differentiable(sympy.Expr, Evaluable):
     @cached_property
     def _uses_symbolic_coefficients(self):
         return bool(self._symbolic_functions)
+
+    @cached_property
+    def coefficients(self):
+        coefficients = {f.coefficients for f in self._functions}
+        # If there is multiple ones, we have to revert to the highest priority
+        # i.e we have to remove symbolic
+        key = lambda x: coeff_priority[x]
+        return sorted(coefficients, key=key, reverse=True)[0]
 
     @cached_property
     def _coeff_symbol(self, *args, **kwargs):
@@ -305,7 +313,7 @@ class Differentiable(sympy.Expr, Evaluable):
                                       fd_order=order)
                      for i, d in enumerate(derivs)])
 
-    def div(self, shift=None, order=None):
+    def div(self, shift=None, order=None, method='FD'):
         """
         Divergence of the input Function.
 
@@ -318,16 +326,18 @@ class Differentiable(sympy.Expr, Evaluable):
         order: int, optional, default=None
             Discretization order for the finite differences.
             Uses `func.space_order` when not specified
-
+        method: str, optional, default='FD'
+            Discretization method. Options are 'FD' (default) and
+            'RSFD' (rotated staggered grid finite-difference).
         """
         space_dims = [d for d in self.dimensions if d.is_Space]
         shift_x0 = make_shift_x0(shift, (len(space_dims),))
         order = order or self.space_order
         return Add(*[getattr(self, 'd%s' % d.name)(x0=shift_x0(shift, d, None, i),
-                                                   fd_order=order)
+                                                   fd_order=order, method=method)
                      for i, d in enumerate(space_dims)])
 
-    def grad(self, shift=None, order=None):
+    def grad(self, shift=None, order=None, method='FD'):
         """
         Gradient of the input Function.
 
@@ -340,14 +350,16 @@ class Differentiable(sympy.Expr, Evaluable):
         order: int, optional, default=None
             Discretization order for the finite differences.
             Uses `func.space_order` when not specified
-
+        method: str, optional, default='FD'
+            Discretization method. Options are 'FD' (default) and
+            'RSFD' (rotated staggered grid finite-difference).
         """
         from devito.types.tensor import VectorFunction, VectorTimeFunction
         space_dims = [d for d in self.dimensions if d.is_Space]
         shift_x0 = make_shift_x0(shift, (len(space_dims),))
         order = order or self.space_order
         comps = [getattr(self, 'd%s' % d.name)(x0=shift_x0(shift, d, None, i),
-                                               fd_order=order)
+                                               fd_order=order, method=method)
                  for i, d in enumerate(space_dims)]
         vec_func = VectorTimeFunction if self.is_TimeDependent else VectorFunction
         return vec_func(name='grad_%s' % self.name, time_order=self.time_order,
@@ -659,7 +671,7 @@ class IndexSum(sympy.Expr, Evaluable):
         expr = self.expr._evaluate(**kwargs)
 
         if not kwargs.get('expand', True):
-            return self.func(expr, self.dimensions)
+            return self._rebuild(expr)
 
         values = product(*[list(d.range) for d in self.dimensions])
         terms = []
@@ -745,7 +757,7 @@ class Weights(Array):
         except TypeError:
             # E.g., `idx` is a tuple
             v = self._npweights[idx]
-        if v.is_Number:
+        if v.is_Number or v.is_Indexed:
             return sympy.sympify(v)
         else:
             return self[idx]
@@ -821,7 +833,7 @@ class IndexDerivative(IndexSum):
         mapper = {w.subs(d, i): f.weights[n] for n, i in enumerate(d.range)}
         expr = expr.xreplace(mapper)
 
-        return EvalDerivative(expr, base=self.base)
+        return EvalDerivative(*expr.args, base=self.base)
 
 
 class DiffDerivative(IndexDerivative, DifferentiableOp):
