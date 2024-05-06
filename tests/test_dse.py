@@ -269,7 +269,7 @@ def test_factorize(expr, expected):
     ('Eq(fb, fd.dx)', 10, False),
     ('Eq(fb, fd.dx)', 10, True),
     ('Eq(fb, fd.dx._evaluate(expand=False))', 10, False),
-    ('Eq(fb, fd.dx.dy + fa.dx)', 66, False),
+    ('Eq(fb, fd.dx.dy + fa.dx)', 65, False),
     # Ensure redundancies aren't counted
     ('Eq(t0, fd.dx.dy + fa*fd.dx.dy)', 62, True),
 ])
@@ -2826,7 +2826,7 @@ class TestTTI(object):
 
     @switchconfig(profiling='advanced')
     @pytest.mark.parametrize('space_order,exp_ops,exp_arrays', [
-        (4, 122, 6), (8, 235, 7)
+        (4, 122, 6), (8, 225, 7)
     ])
     def test_opcounts_adjoint(self, space_order, exp_ops, exp_arrays):
         wavesolver = self.tti_operator(space_order=space_order,
