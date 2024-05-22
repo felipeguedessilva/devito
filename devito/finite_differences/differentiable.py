@@ -1,8 +1,7 @@
 from collections import ChainMap
 from itertools import product
-from functools import singledispatch
+from functools import singledispatch, cached_property
 
-from cached_property import cached_property
 import numpy as np
 import sympy
 from sympy.core.add import _addsort
@@ -120,6 +119,13 @@ class Differentiable(sympy.Expr, Evaluable):
     @cached_property
     def _symbolic_functions(self):
         return frozenset([i for i in self._functions if i.coefficients == 'symbolic'])
+
+    @cached_property
+    def function(self):
+        if len(self._functions) == 1:
+            return self._functions.pop()
+        else:
+            return None
 
     @cached_property
     def _uses_symbolic_coefficients(self):
