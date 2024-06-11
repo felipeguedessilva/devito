@@ -4,23 +4,24 @@ from functools import cached_property
 
 from conftest import _R, assert_blocking, assert_structure
 from devito import (Grid, Constant, Function, TimeFunction, SparseFunction,
-                    SparseTimeFunction, Dimension, ConditionalDimension, SubDimension,
-                    SubDomain, Eq, Ne, Inc, NODE, Operator, norm, inner, configuration,
-                    switchconfig, generic_derivative, PrecomputedSparseFunction,
-                    DefaultDimension)
+                    SparseTimeFunction, Dimension, ConditionalDimension,
+                    SubDimension, SubDomain, Eq, Ne, Inc, NODE, Operator, norm,
+                    inner, configuration, switchconfig, generic_derivative,
+                    PrecomputedSparseFunction, DefaultDimension)
 from devito.arch.compiler import OneapiCompiler
 from devito.data import LEFT, RIGHT
 from devito.ir.iet import (Call, Conditional, Iteration, FindNodes, FindSymbols,
                            retrieve_iteration_tree)
 from devito.mpi import MPI
-from devito.mpi.routines import HaloUpdateCall, HaloUpdateList, MPICall, ComputeCall
+from devito.mpi.routines import (HaloUpdateCall, HaloUpdateList, MPICall,
+                                 ComputeCall)
 from devito.mpi.distributed import CustomTopology
 from devito.tools import Bunch
 
 from examples.seismic.acoustic import acoustic_setup
 
 
-class TestDistributor(object):
+class TestDistributor:
 
     @pytest.mark.parallel(mode=[2, 4])
     def test_partitioning(self, mode):
@@ -228,7 +229,7 @@ class TestDistributor(object):
         assert custom_topology == dist_topology
 
 
-class TestFunction(object):
+class TestFunction:
 
     @pytest.mark.parallel(mode=2)
     def test_halo_exchange_bilateral(self, mode):
@@ -435,7 +436,7 @@ class TestFunction(object):
             MPI.Finalize()
 
 
-class TestSparseFunction(object):
+class TestSparseFunction:
 
     @pytest.mark.parallel(mode=4)
     @pytest.mark.parametrize('shape, coords, points', [
@@ -526,9 +527,13 @@ class TestSparseFunction(object):
         loc_data = loc_data*2
 
         # Gather
-        sf._dist_gather(loc_data, loc_coords)
+        sf._dist_data_gather(loc_data)
         assert len(sf.data) == 1
         assert np.all(sf.data == data[sf.local_indices]*2)
+
+        sf._dist_subfunc_gather(loc_coords, sf.coordinates)
+        assert sf.coordinates.data.shape == (1, 2)
+        assert np.all(sf.coordinates.data == coords[sf.local_indices[0], :])
 
     @pytest.mark.parallel(mode=4)
     @switchconfig(condition=isinstance(configuration['compiler'],
@@ -699,7 +704,7 @@ class TestSparseFunction(object):
         assert np.all(s.data == 1)
 
 
-class TestOperatorSimple(object):
+class TestOperatorSimple:
 
     @pytest.mark.parallel(mode=[2, 4, 8])
     def test_trivial_eq_1d(self, mode):
@@ -891,7 +896,7 @@ class TestOperatorSimple(object):
         assert np.all(f2.data == 1.)
 
 
-class TestCodeGeneration(object):
+class TestCodeGeneration:
 
     @pytest.mark.parallel(mode=1)
     def test_avoid_haloupdate_as_nostencil_basic(self, mode):
@@ -1604,7 +1609,7 @@ class TestCodeGeneration(object):
         assert len(calls) == 2   # One for `v` and one for `usave`
 
 
-class TestOperatorAdvanced(object):
+class TestOperatorAdvanced:
 
     @pytest.mark.parallel(mode=4)
     def test_injection_wodup(self, mode):
@@ -2582,7 +2587,7 @@ def gen_serial_norms(shape, so):
         np.save("norms%s.npy" % len(shape), (Eu, Erec, Ev, Esrca, day), allow_pickle=True)
 
 
-class TestIsotropicAcoustic(object):
+class TestIsotropicAcoustic:
 
     """
     Test the isotropic acoustic wave equation with MPI.
@@ -2633,14 +2638,17 @@ class TestIsotropicAcoustic(object):
         solver = acoustic_setup(shape=shape, spacing=[15. for _ in shape],
                                 tn=tn, space_order=so, nrec=nrec,
                                 preset='layers-isotropic', dtype=np.float64)
+
         # Run forward operator
-        rec, u, _ = solver.forward()
+        src = solver.geometry.src
+        rec, u, _ = solver.forward(src=src)
 
         assert np.isclose(norm(u) / Eu, 1.0)
         assert np.isclose(norm(rec) / Erec, 1.0)
 
         # Run adjoint operator
-        srca, v, _ = solver.adjoint(rec=rec)
+        srca = src.func(name='srca')
+        srca, v, _ = solver.adjoint(srca=srca, rec=rec)
 
         assert np.isclose(norm(v) / Ev, 1.0)
         assert np.isclose(norm(srca) / Esrca, 1.0)
