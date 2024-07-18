@@ -13,7 +13,7 @@ from devito import (NODE, Eq, Inc, Constant, Function, TimeFunction,  # noqa
                     ConditionalDimension, DefaultDimension, Grid, Operator,
                     norm, grad, div, dimensions, switchconfig, configuration,
                     centered, first_derivative, solve, transpose, Abs, cos,
-                    sin, sqrt)
+                    sin, sqrt, Ge, Lt)
 from devito.exceptions import InvalidArgument, InvalidOperator
 from devito.finite_differences.differentiable import diffify
 from devito.ir import (Conditional, DummyEq, Expression, Iteration, FindNodes,
@@ -168,6 +168,78 @@ def test_cse_temp_order():
     assert type(args[2]) is CTemp
 
 
+def test_cse_w_conditionals():
+    grid = Grid(shape=(10, 10, 10))
+    x, _, _ = grid.dimensions
+
+    cd = ConditionalDimension(name='cd', parent=x, condition=Ge(x, 4),
+                              indirect=True)
+
+    f = Function(name='f', grid=grid)
+    g = Function(name='g', grid=grid)
+    h = Function(name='h', grid=grid)
+    a0 = Function(name='a0', grid=grid)
+    a1 = Function(name='a1', grid=grid)
+
+    eqns = [Eq(h, a0, implicit_dims=cd),
+            Eq(a0, a0 + f*g, implicit_dims=cd),
+            Eq(a1, a1 + f*g, implicit_dims=cd)]
+
+    op = Operator(eqns)
+
+    assert_structure(op, ['x,y,z'], 'xyz')
+    assert len(FindNodes(Conditional).visit(op)) == 1
+
+
+def test_cse_w_multi_conditionals():
+    grid = Grid(shape=(10, 10, 10))
+    x, _, _ = grid.dimensions
+
+    cd = ConditionalDimension(name='cd', parent=x, condition=Ge(x, 4),
+                              indirect=True)
+
+    cd2 = ConditionalDimension(name='cd2', parent=x, condition=Lt(x, 4),
+                               indirect=True)
+
+    f = Function(name='f', grid=grid)
+    g = Function(name='g', grid=grid)
+    h = Function(name='h', grid=grid)
+    a0 = Function(name='a0', grid=grid)
+    a1 = Function(name='a1', grid=grid)
+    a2 = Function(name='a2', grid=grid)
+    a3 = Function(name='a3', grid=grid)
+
+    eq0 = Eq(h, a0, implicit_dims=cd)
+    eq1 = Eq(a0, a0 + f*g, implicit_dims=cd)
+    eq2 = Eq(a1, a1 + f*g, implicit_dims=cd)
+    eq3 = Eq(a2, a2 + f*g, implicit_dims=cd2)
+    eq4 = Eq(a3, a3 + f*g, implicit_dims=cd2)
+
+    op = Operator([eq0, eq1, eq3])
+
+    assert_structure(op, ['x,y,z'], 'xyz')
+    assert len(FindNodes(Conditional).visit(op)) == 2
+
+    tmps = [s for s in FindSymbols().visit(op) if s.name.startswith('r')]
+    assert len(tmps) == 0
+
+    op = Operator([eq0, eq1, eq3, eq4])
+
+    assert_structure(op, ['x,y,z'], 'xyz')
+    assert len(FindNodes(Conditional).visit(op)) == 2
+
+    tmps = [s for s in FindSymbols().visit(op) if s.name.startswith('r')]
+    assert len(tmps) == 1
+
+    op = Operator([eq0, eq1, eq2, eq3, eq4])
+
+    assert_structure(op, ['x,y,z'], 'xyz')
+    assert len(FindNodes(Conditional).visit(op)) == 2
+
+    tmps = [s for s in FindSymbols().visit(op) if s.name.startswith('r')]
+    assert len(tmps) == 2
+
+
 @pytest.mark.parametrize('expr,expected', [
     ('2*fa[x] + fb[x]', '2*fa[x] + fb[x]'),
     ('fa[x]**2', 'fa[x]*fa[x]'),
@@ -187,6 +259,9 @@ def test_cse_temp_order():
     ('Mul(SizeOf("char"), '
      '-IndexedPointer(FieldFromPointer("size", fa._C_symbol), x), evaluate=False)',
      'sizeof(char)*(-fa_vec->size[x])'),
+    ('sqrt(fa[x]**4)', 'sqrt(fa[x]*fa[x]*fa[x]*fa[x])'),
+    ('sqrt(fa[x])**2', 'fa[x]'),
+    ('fa[x]**-2', '1/(fa[x]*fa[x])'),
 ])
 def test_pow_to_mul(expr, expected):
     grid = Grid((4, 5))
@@ -1686,7 +1761,7 @@ class TestAliases:
         op1 = Operator(eqn, opt=('advanced-fsg', {'openmp': True, 'cire-mingain': 0}))
 
         # Check code generation
-        bns, _ = assert_blocking(op1, {'x0_blk0', 'x1_blk0'})
+        bns, _ = assert_blocking(op1, {'x0_blk0'})
         xs, ys, zs = get_params(op1, 'x_size', 'y_size', 'z_size')
         arrays = [i for i in FindSymbols().visit(bns['x0_blk0']) if i.is_Array]
         assert len(arrays) == 1

@@ -37,7 +37,7 @@ def clusterize(exprs, **kwargs):
     clusters = Schedule().process(clusters)
 
     # Handle SteppingDimensions
-    clusters = Stepper().process(clusters)
+    clusters = Stepper(**kwargs).process(clusters)
 
     # Handle ConditionalDimensions
     clusters = guard(clusters)
@@ -273,6 +273,9 @@ class Stepper(Queue):
     sub-iterators induced by a SteppingDimension.
     """
 
+    def __init__(self, sregistry=None, **kwargs):
+        self.sregistry = sregistry
+
     def callback(self, clusters, prefix):
         if not prefix:
             return clusters
@@ -326,7 +329,7 @@ class Stepper(Queue):
                 siafs = sorted(iafs, key=key)
 
                 for iaf in siafs:
-                    name = '%s%d' % (si.name, len(mds))
+                    name = self.sregistry.make_name(prefix='t')
                     offset = uxreplace(iaf, {si: d.root})
                     mds.append(ModuloDimension(name, si, offset, size, origin=iaf))
 
@@ -340,6 +343,11 @@ class Stepper(Queue):
         # Reconstruct the Clusters
         processed = []
         for c in clusters:
+            exprs = c.exprs
+
+            sub_iterators = dict(c.ispace.sub_iterators)
+            sub_iterators[d] = [i for i in sub_iterators[d] if i not in subiters]
+
             # Apply substitutions to expressions
             # Note: In an expression, there could be `u[t+1, ...]` and `v[t+1,
             # ...]`, where `u` and `v` are TimeFunction with circular time
@@ -347,17 +355,19 @@ class Stepper(Queue):
             # indices above are therefore conceptually different, so they will
             # be replaced with the proper ModuloDimension through two different
             # calls to `xreplace_indices`
-            exprs = c.exprs
             groups = as_mapper(mds, lambda d: d.modulo)
             for size, v in groups.items():
-                subs = {md.origin: md for md in v}
-                func = partial(xreplace_indices, mapper=subs, key=partial(rule, size))
+                key = partial(rule, size)
+                if size == 1:
+                    # Optimization -- avoid useless "% 1" ModuloDimensions
+                    subs = {md.origin: 0 for md in v}
+                else:
+                    subs = {md.origin: md for md in v}
+                    sub_iterators[d].extend(v)
+
+                func = partial(xreplace_indices, mapper=subs, key=key)
                 exprs = [e.apply(func) for e in exprs]
 
-            # Augment IterationSpace
-            sub_iterators = dict(c.ispace.sub_iterators)
-            sub_iterators[d] = tuple(i for i in sub_iterators[d] + tuple(mds)
-                                     if i not in subiters)
             ispace = IterationSpace(c.ispace.intervals, sub_iterators,
                                     c.ispace.directions)
 
@@ -430,7 +440,7 @@ class HaloComms(Queue):
 
             key = lambda i: i in prefix[:-1] or i in hs.loc_indices
             ispace = c.ispace.project(key)
-            # HaloTOuch are not parallel
+            # HaloTouches are not parallel
             properties = c.properties.sequentialize()
 
             halo_touch = c.rebuild(exprs=expr, ispace=ispace, properties=properties)
@@ -611,6 +621,11 @@ def _normalize_reductions_dense(cluster, sregistry, mapper):
             # of the target backend
             lhs, rhs = e.args
 
+            try:
+                f = rhs.function
+            except AttributeError:
+                f = None
+
             if lhs.function.is_Array:
                 # Probably a compiler-generated reduction, e.g. via
                 # recursive compilation; it's an Array already, so nothing to do
@@ -618,11 +633,13 @@ def _normalize_reductions_dense(cluster, sregistry, mapper):
             elif rhs in mapper:
                 # Seen this RHS already, so reuse the Array that was created for it
                 processed.append(e.func(lhs, mapper[rhs].indexify()))
+            elif f and f.is_Array and sum(flatten(f._size_nodomain)) == 0:
+                # Special case: the RHS is an Array with no halo/padding, meaning
+                # that the written data values are contiguous in memory, hence
+                # we can simply reuse the Array itself as we're already in the
+                # desired memory layout
+                processed.append(e)
             else:
-                # Here the LHS could be a Symbol or a user-level Function
-                # In the latter case we copy the data into a temporary Array
-                # because the Function might be padded, and reduction operations
-                # require, in general, the data values to be contiguous
                 name = sregistry.make_name()
                 try:
                     grid = cluster.grid

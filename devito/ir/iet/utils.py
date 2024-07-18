@@ -106,7 +106,8 @@ def derive_parameters(iet, drop_locals=False, ordering='default'):
     basics = FindSymbols('basics').visit(iet)
     candidates.extend(i.function for i in basics)
 
-    # Filter off duplicates (e.g., `x_size` is extracted by both calls to FindSymbols)
+    # Filter off duplicates (e.g., `x_size` is extracted by both calls to
+    # FindSymbols)
     candidates = filter_ordered(candidates)
 
     # Filter off symbols which are defined somewhere within `iet`
@@ -122,7 +123,8 @@ def derive_parameters(iet, drop_locals=False, ordering='default'):
 
     # Maybe filter out all other compiler-generated objects
     if drop_locals:
-        parameters = [p for p in parameters if not (p.is_ArrayBasic or p.is_LocalObject)]
+        parameters = [p for p in parameters
+                      if not (p.is_ArrayBasic or p.is_LocalObject)]
 
     # NOTE: This is requested by the caller when the parameters are used to
     # construct Callables whose signature only depends on the object types,

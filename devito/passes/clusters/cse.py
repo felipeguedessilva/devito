@@ -1,18 +1,26 @@
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, namedtuple
 from functools import singledispatch
 
+import sympy
 from sympy import Add, Function, Indexed, Mul, Pow
-from sympy.core.core import ordering_of_classes
+try:
+    from sympy.core.core import ordering_of_classes
+except ImportError:
+    # Moved in 1.13
+    from sympy.core.basic import ordering_of_classes
 
 from devito.finite_differences.differentiable import IndexDerivative
 from devito.ir import Cluster, Scope, cluster_pass
 from devito.passes.clusters.utils import makeit_ssa
 from devito.symbolics import estimate_cost, q_leaf
 from devito.symbolics.manipulation import _uxreplace
-from devito.tools import as_list
+from devito.tools import as_list, frozendict
 from devito.types import Eq, Symbol, Temp
 
 __all__ = ['cse']
+
+
+Counted = namedtuple('Candidate', 'expr, conditionals')
 
 
 class CTemp(Temp):
@@ -87,35 +95,38 @@ def _cse(maybe_exprs, make, min_cost=1, mode='default'):
     while True:
         # Detect redundancies
         counted = count(processed).items()
-        targets = OrderedDict([(k, estimate_cost(k, True)) for k, v in counted if v > 1])
-
+        targets = OrderedDict([(k, estimate_cost(k.expr, True))
+                               for k, v in counted if v > 1])
         # Rule out Dimension-independent data dependencies
         targets = OrderedDict([(k, v) for k, v in targets.items()
-                               if not k.free_symbols & exclude])
-
+                               if not k.expr.free_symbols & exclude])
         if not targets or max(targets.values()) < min_cost:
             break
 
         # Create temporaries
         hit = max(targets.values())
-        temps = [Eq(make(), k) for k, v in targets.items() if v == hit]
+        chosen = [(k, make()) for k, v in targets.items() if v == hit]
 
         # Apply replacements
         # The extracted temporaries are inserted before the first expression
         # that contains it
+        scheduled = []
         updated = []
         for e in processed:
             pe = e
-            for t in temps:
-                pe, changed = _uxreplace(pe, {t.rhs: t.lhs})
-                if changed and t not in updated:
-                    updated.append(t)
+            for k, v in chosen:
+                if not k.conditionals == e.conditionals:
+                    continue
+                pe, changed = _uxreplace(pe, {k.expr: v})
+                if changed and v not in scheduled:
+                    updated.append(pe.func(v, k.expr, operation=None))
+                    scheduled.append(v)
             updated.append(pe)
         processed = updated
 
         # Update `exclude` for the same reasons as above -- to rule out CSE across
         # Dimension-independent data dependences
-        exclude.update({t.lhs for t in temps})
+        exclude.update(scheduled)
 
     # At this point we may have useless temporaries (e.g., r0=r1). Let's drop them
     processed = _compact_temporaries(processed, exclude)
@@ -166,7 +177,18 @@ def _(exprs):
     mapper = Counter()
     for e in exprs:
         mapper.update(count(e))
+
     return mapper
+
+
+@count.register(sympy.Eq)
+def _(expr):
+    mapper = count(expr.rhs)
+    try:
+        cond = expr.conditionals
+    except AttributeError:
+        cond = frozendict()
+    return {Counted(e, cond): v for e, v in mapper.items()}
 
 
 @count.register(Indexed)

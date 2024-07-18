@@ -210,6 +210,25 @@ class TestBufferedDimension:
         assert np.all(f.data[3] == 2)
         assert np.all(f.data[4] == 4)
 
+    def test_degenerate_to_zero(self):
+        """
+        Check that if `save=Buffer(1)` is used, then the TimeFunction doesn't
+        need any ModuloDimension for indexing.
+        """
+        grid = Grid(shape=(10, 10))
+
+        u = TimeFunction(name='u', grid=grid, save=Buffer(1))
+
+        eq = Eq(u.forward, u + 1)
+
+        op = Operator(eq)
+
+        assert len([i for i in FindSymbols('dimensions').visit(op) if i.is_Modulo]) == 0
+
+        op.apply(time_M=9)
+
+        assert np.all(u.data == 10)
+
 
 class TestSubDimension:
 
@@ -539,6 +558,34 @@ class TestSubDimension:
         assert np.all(u.data[1, 0:thickness, -thickness:] == 0)
         assert np.all(u.data[1, 0:thickness, thickness:-thickness] == 1)
         assert np.all(u.data[1, thickness+1:, :] == 0)
+
+    @pytest.mark.parametrize('thickness,flag', [
+        (4, True),
+        (8, False)
+    ])
+    def test_subdim_local_parallel(self, thickness, flag):
+        """
+        A variation of `test_subdimleft_parallel` where the thickness, whose
+        value is statically known, explicitly appears in the equations.
+        """
+        grid = Grid(shape=(30, 30, 30))
+        x, y, z = grid.dimensions
+        t = grid.stepping_dim
+
+        u = TimeFunction(name='u', grid=grid, space_order=4)
+        v = TimeFunction(name='v', grid=grid, space_order=4)
+
+        zl = SubDimension.left(name='zl', parent=z, thickness=thickness)
+
+        eqns = [Eq(u[t, x, y, zl], u[t, x, y, 8 - zl]),
+                Eq(v[t, x, y, zl], v[t, x, y, 8 - zl])]
+
+        op = Operator(eqns)
+
+        if flag:
+            assert_structure(op, ['t,x,y,z'], 't,x,y,z')
+        else:
+            assert_structure(op, ['t,x,y,z', 't,x,y,z'], 't,x,y,z,z')
 
     def test_subdimmiddle_notparallel(self):
         """
@@ -965,6 +1012,35 @@ class TestConditionalDimension:
         op = Operator([eq_p])
         op.apply(time_M=1)
         assert np.all(np.flatnonzero(f.data) == [3, 30])
+
+    def test_issue_2273(self):
+        grid = Grid(shape=(11, 11))
+        time = grid.time_dim
+
+        nt = 200
+        bounds = (10, 100)
+        factor = 5
+
+        condition = And(Ge(time, bounds[0]), Le(time, bounds[1]))
+
+        time_under = ConditionalDimension(name='timeu', parent=time,
+                                          factor=factor, condition=condition)
+        buffer_size = (bounds[1] - bounds[0] + factor) // factor + 1
+
+        rec = SparseTimeFunction(name='rec', grid=grid, npoint=1, nt=nt,
+                                 coordinates=[(.5, .5)])
+        rec.data[:] = 1.0
+
+        u = TimeFunction(name='u', grid=grid, space_order=2)
+        usaved = TimeFunction(name='usaved', grid=grid, space_order=2,
+                              time_dim=time_under, save=buffer_size)
+
+        eq = [Eq(u.forward, u)] + rec.inject(field=u.forward, expr=rec) + [Eq(usaved, u)]
+
+        op = Operator(eq)
+        op(time_m=0, time_M=nt-1)
+        expected = np.linspace(bounds[0], bounds[1], num=buffer_size-1)
+        assert np.allclose(usaved.data[:-1, 5, 5], expected)
 
     def test_subsampled_fd(self):
         """
@@ -1481,7 +1557,7 @@ class TestConditionalDimension:
 
         eqns = [Eq(f.forward, f + 1),
                 Eq(h, f + 1),
-                Eq(g, f.dx + 1, implicit_dims=[ctime])]
+                Eq(g, f.dx + h + 1, implicit_dims=[ctime])]
 
         op = Operator(eqns)
 
@@ -1511,10 +1587,10 @@ class TestConditionalDimension:
 
         eqns = [Eq(f.forward, f + 1),
                 Eq(h, f + 1),
-                Eq(g, f + 1, implicit_dims=[ctime]),
-                Eq(f.forward, f + 1, implicit_dims=[ctime]),
-                Eq(f.forward, f + 1),
-                Eq(g, f + 1)]
+                Eq(g, f + h + 1, implicit_dims=[ctime]),
+                Eq(f.forward, f + h + 1, implicit_dims=[ctime]),
+                Eq(f.forward, f.dx + h + 1),
+                Eq(g, f.dx + h + 1)]
 
         op = Operator(eqns)
 
