@@ -1307,10 +1307,8 @@ class BlockDimension(AbstractIncrDimension):
             return ()
 
     def _arg_defaults(self, **kwargs):
-        # TODO: need a heuristic to pick a default incr size
-        # TODO: move default value to __new__
         try:
-            return {self.step.name: 8}
+            return {self.step.name: 16}
         except AttributeError:
             # `step` not a Symbol
             return {}
@@ -1329,6 +1327,8 @@ class BlockDimension(AbstractIncrDimension):
             # no value supplied -> the sub-block will span the entire block
             return {name: args[self.parent.step.name]}
         else:
+            # TODO": Check the args for space order and apply heuristics (e.g.,
+            # `2*space_order`?) for even better block sizes
             value = self._arg_defaults()[name]
             if value <= args[self.root.max_name] - args[self.root.min_name] + 1:
                 return {name: value}

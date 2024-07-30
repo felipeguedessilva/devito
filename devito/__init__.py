@@ -22,6 +22,7 @@ from devito.types.tensor import *  # noqa
 from devito.finite_differences import *  # noqa
 from devito.operations.solve import *
 from devito.operator import Operator  # noqa
+from devito.symbolics import CondEq, CondNe  # noqa
 
 # Other stuff exposed to the user
 from devito.builtins import *  # noqa
@@ -64,18 +65,24 @@ def reinit_compiler(val):
 # Setup target platform and compiler
 configuration.add('platform', 'cpu64', list(platform_registry),
                   callback=lambda i: platform_registry[i]())
-configuration.add('compiler', 'custom', list(compiler_registry),
+configuration.add('compiler', 'custom', compiler_registry,
                   callback=lambda i: compiler_registry[i]())
 
 # Setup language for shared-memory parallelism
 preprocessor = lambda i: {0: 'C', 1: 'openmp'}.get(i, i)  # Handles DEVITO_OPENMP deprec
 configuration.add('language', 'C', [0, 1] + list(operator_registry._languages),
-                  preprocessor=preprocessor, callback=reinit_compiler, deprecate='openmp')
+                  preprocessor=preprocessor, callback=reinit_compiler,
+                  deprecate='openmp')
 
 # MPI mode (0 => disabled, 1 == basic)
 preprocessor = lambda i: bool(i) if isinstance(i, int) else i
 configuration.add('mpi', 0, [0, 1] + list(mpi_registry),
                   preprocessor=preprocessor, callback=reinit_compiler)
+
+# Domain decomposition topology. Only relevant with MPI
+preprocessor = lambda i: CustomTopology._shortcuts.get(i)
+configuration.add('topology', None, [None] + list(CustomTopology._shortcuts),
+                  preprocessor=preprocessor)
 
 # Should Devito run a first-touch Operator upon data allocation?
 configuration.add('first-touch', 0, [0, 1], preprocessor=bool, impacts_jit=False)

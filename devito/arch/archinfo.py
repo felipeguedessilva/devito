@@ -1,16 +1,16 @@
 """Collection of utilities to detect properties of the underlying architecture."""
 
-from subprocess import PIPE, Popen, DEVNULL, run
-
 from functools import cached_property
-import cpuinfo
+from subprocess import PIPE, Popen, DEVNULL, run
 import ctypes
-import numpy as np
-import psutil
 import re
 import os
 import sys
 import json
+
+import cpuinfo
+import numpy as np
+import psutil
 
 from devito.logger import warning
 from devito.tools import as_tuple, all_equal, memoized_func
@@ -25,7 +25,8 @@ __all__ = ['platform_registry', 'get_cpu_info', 'get_gpu_info', 'get_nvidia_cc',
            'INTEL64', 'SNB', 'IVB', 'HSW', 'BDW', 'KNL', 'KNL7210',
            'SKX', 'KLX', 'CLX', 'CLK', 'SPR',
            # ARM CPUs
-           'AMD', 'ARM', 'AppleArm', 'M1', 'M2', 'M3', 'GRAVITON',
+           'AMD', 'ARM', 'AppleArm', 'M1', 'M2', 'M3',
+           'Graviton', 'GRAVITON2', 'GRAVITON3', 'GRAVITON4',
            # Other legacy CPUs
            'POWER8', 'POWER9',
            # Generic GPUs
@@ -664,6 +665,16 @@ class Platform:
         assert self.max_mem_trans_nbytes % np.dtype(dtype).itemsize == 0
         return int(self.max_mem_trans_nbytes / np.dtype(dtype).itemsize)
 
+    def limits(self, compiler=None, language=None):
+        """
+        Return the architecture-specific limits for the given compiler and
+        language.
+        """
+        return {
+            'max-par-dims': sys.maxsize,
+            'max-block-dims': sys.maxsize,
+        }
+
 
 class Cpu64(Platform):
 
@@ -764,6 +775,20 @@ class AppleArm(Arm):
         return min(mx, 'm2')
 
 
+class Graviton(Arm):
+
+    @property
+    def version(self):
+        return int(self.name.split('graviton')[-1])
+
+    @cached_property
+    def march(self):
+        if self.version >= 4:
+            return 'neoverse-n2'
+        else:
+            return 'neoverse-n1'
+
+
 class Amd(Cpu64):
 
     known_isas = ('cpp', 'sse', 'avx', 'avx2')
@@ -831,6 +856,12 @@ class Device(Platform):
             return info['mem.free'](deviceid)
         except (AttributeError, KeyError):
             return None
+
+    def limits(self, compiler=None, language=None):
+        return {
+            'max-par-dims': 3,
+            'max-block-dims': 3,
+        }
 
 
 class IntelDevice(Device):
@@ -912,7 +943,9 @@ CLK = IntelSkylake('clk')  # Cascade Lake
 SPR = IntelGoldenCove('spr')  # Sapphire Rapids
 
 ARM = Arm('arm')
-GRAVITON = Arm('graviton')
+GRAVITON2 = Graviton('graviton2')
+GRAVITON3 = Graviton('graviton3')
+GRAVITON4 = Graviton('graviton4')
 M1 = AppleArm('m1')
 M2 = AppleArm('m2')
 M3 = AppleArm('m3')
