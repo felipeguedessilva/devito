@@ -7,10 +7,12 @@ from math import ceil
 from tempfile import gettempdir
 
 from sympy import sympify
+import numpy as np
 
 from devito.arch import ANYCPU, Device, compiler_registry, platform_registry
 from devito.data import default_allocator
-from devito.exceptions import InvalidOperator, ExecutionError
+from devito.exceptions import (CompilationError, ExecutionError, InvalidArgument,
+                               InvalidOperator)
 from devito.logger import debug, info, perf, warning, is_log_enabled_for, switch_log_level
 from devito.ir.equations import LoweredEq, lower_exprs, concretize_subdims
 from devito.ir.clusters import ClusterGroup, clusterize
@@ -93,6 +95,7 @@ class Operator(Callable):
     ...                Eq(u[t+1, 2, y], 0)])
 
     A semantically equivalent computation can be expressed exploiting SubDomains.
+    This is the only way for expressing BCs, when running with MPI.
 
     >>> u.data[:] = 0
     >>> op = Operator(Eq(u.forward, u + 1, subdomain=grid.interior))
@@ -186,7 +189,8 @@ class Operator(Callable):
 
         for i in expressions:
             if not isinstance(i, Evaluable):
-                raise InvalidOperator("`%s` is not an `Evaluable` object" % str(i))
+                raise CompilationError(f"`{i!s}` is not an Evaluable object; "
+                                       "check your equation again")
 
         return expressions
 
@@ -550,7 +554,7 @@ class Operator(Callable):
         if not configuration['ignore-unknowns']:
             for k, v in kwargs.items():
                 if k not in self._known_arguments:
-                    raise ValueError("Unrecognized argument %s=%s" % (k, v))
+                    raise InvalidArgument(f"Unrecognized argument `{k}={v}`")
 
         # Pre-process Dimension overrides. This may help ruling out ambiguities
         # when processing the `defaults` arguments. A topological sorting is used
@@ -580,8 +584,10 @@ class Operator(Callable):
             try:
                 args.reduce_inplace()
             except ValueError:
-                raise ValueError("Override `%s` is incompatible with overrides `%s`" %
-                                 (p, [i for i in overrides if i.name in args]))
+                v = [i for i in overrides if i.name in args]
+                raise InvalidArgument(
+                    f"Override `{p}` is incompatible with overrides `{v}`"
+                )
 
         # Process data-carrier defaults
         for p in defaults:
@@ -601,10 +607,11 @@ class Operator(Callable):
                     # `fact` is supplied w/o overriding `usave`; that's legal
                     pass
                 elif is_integer(args[k]) and not contains_val(args[k], v):
-                    raise ValueError("Default `%s` is incompatible with other args as "
-                                     "`%s=%s`, while `%s=%s` is expected. Perhaps you "
-                                     "forgot to override `%s`?" %
-                                     (p, k, v, k, args[k], p))
+                    raise InvalidArgument(
+                        f"Default `{p}` is incompatible with other args as "
+                        f"`{k}={v}`, while `{k}={args[k]}` is expected. Perhaps "
+                        f"you forgot to override `{p}`?"
+                    )
 
         args = kwargs['args'] = args.reduce_all()
 
@@ -690,6 +697,18 @@ class Operator(Callable):
             raise ExecutionError("Detected nan/inf in some output Functions")
         elif retval == error_mapper['KernelLaunch']:
             raise ExecutionError("Kernel launch failed")
+        elif retval == error_mapper['KernelLaunchOutOfResources']:
+            raise ExecutionError(
+                "Kernel launch failed due to insufficient resources. This may be "
+                "due to excessive register pressure in one of the Operator "
+                "kernels. Try supplying a smaller `par-tile` value."
+            )
+        elif retval == error_mapper['KernelLaunchUnknown']:
+            raise ExecutionError(
+                "Kernel launch failed due to an unknown error. This might "
+                "simply indicate memory corruption, but also, in a more unlikely "
+                "case, a hardware issue. Please report this issue to the "
+                "Devito team.")
         else:
             raise ExecutionError("An error occurred during execution")
 
@@ -723,7 +742,7 @@ class Operator(Callable):
         # Check all arguments are present
         for p in self.parameters:
             if args.get(p.name) is None:
-                raise ValueError("No value found for parameter %s" % p.name)
+                raise InvalidArgument(f"No value found for parameter {p.name}")
         return args
 
     # Code generation and JIT compilation
@@ -962,8 +981,10 @@ class Operator(Callable):
 
             v = summary.globals.get('vanilla')
             if v is not None:
-                metrics.append("OI=%.2f" % fround(v.oi))
-                metrics.append("%.2f GFlops/s" % fround(v.gflopss))
+                if v.oi is not None:
+                    metrics.append("OI=%.2f" % fround(v.oi))
+                if v.gflopss is not None and np.isfinite(v.gflopss):
+                    metrics.append("%.2f GFlops/s" % fround(v.gflopss))
 
             v = summary.globals.get('fdlike')
             if v is not None:

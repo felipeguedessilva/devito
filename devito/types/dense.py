@@ -1372,9 +1372,12 @@ class TimeFunction(Function):
 
         # Check we won't allocate too much memory for the system
         available_mem = virtual_memory().available
-        if np.dtype(self.dtype).itemsize * self.size > available_mem:
-            warning("Trying to allocate more memory for symbol %s " % self.name +
-                    "than available on physical device, this will start swapping")
+        required_mem = np.dtype(self.dtype).itemsize * self.size
+        if required_mem > available_mem:
+            raise MemoryError(
+                f"Trying to allocate more memory ({humanbytes(required_mem)}) "
+                f"for `{self.name}` than available ({humanbytes(available_mem)})"
+            )
         if not isinstance(self.time_order, int):
             raise TypeError("`time_order` must be int")
 

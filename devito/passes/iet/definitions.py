@@ -10,14 +10,16 @@ from operator import itemgetter
 import numpy as np
 
 from devito.ir import (Block, Call, Definition, DummyExpr, Return, EntryFunction,
-                       FindSymbols, MapExprStmts, Transformer, make_callable)
+                       FindNodes, FindSymbols, MapExprStmts, Transformer,
+                       make_callable)
 from devito.passes import is_gpu_create
 from devito.passes.iet.engine import iet_pass
 from devito.passes.iet.langbase import LangBB
 from devito.symbolics import (Byref, DefFunction, FieldFromPointer, IndexedPointer,
                               SizeOf, VOID, Keyword, pow_to_mul)
 from devito.tools import as_mapper, as_list, as_tuple, filter_sorted, flatten
-from devito.types import Array, CustomDimension, DeviceMap, DeviceRM, Eq, Symbol
+from devito.types import (Array, ComponentAccess, CustomDimension, DeviceMap,
+                          DeviceRM, Eq, Symbol)
 
 __all__ = ['DataManager', 'DeviceAwareDataManager', 'Storage']
 
@@ -166,11 +168,7 @@ class DataManager:
         """
         decl = Definition(obj)
 
-        # Allocating a mapped Array on the high bandwidth memory requires
-        # multiple statements, hence we implement it as a generic Callable
-        # to minimize code size, since different arrays will ultimately be
-        # able to reuse the same abstract Callable
-
+        # Allocate the Array struct
         memptr = VOID(Byref(obj._C_symbol), '**')
         alignment = obj._data_alignment
         nbytes = SizeOf(obj._C_typedata)
@@ -179,10 +177,12 @@ class DataManager:
         nbytes_param = Symbol(name='nbytes', dtype=np.uint64, is_const=True)
         nbytes_arg = SizeOf(obj.indexed._C_typedata)*obj.size
 
+        # Allocate the underlying host data
         ffp0 = FieldFromPointer(obj._C_field_data, obj._C_symbol)
         memptr = VOID(Byref(ffp0), '**')
         allocs.append(self.lang['host-alloc-pin'](memptr, alignment, nbytes_param))
 
+        # Initialize the Array struct
         ffp1 = FieldFromPointer(obj._C_field_nbytes, obj._C_symbol)
         init0 = DummyExpr(ffp1, nbytes_param)
         ffp2 = FieldFromPointer(obj._C_field_size, obj._C_symbol)
@@ -191,8 +191,7 @@ class DataManager:
         frees = [self.lang['host-free-pin'](ffp0),
                  self.lang['host-free'](obj._C_symbol)]
 
-        # Not all backends require explicit allocation/deallocation of the
-        # `dmap` field
+        # Allocate the underlying device data, if required by the backend
         alloc, free = self._make_dmap_allocfree(obj, nbytes_param)
 
         # Chain together all allocs and frees
@@ -201,6 +200,8 @@ class DataManager:
 
         ret = Return(obj._C_symbol)
 
+        # Wrap everything in a Callable so that we can reuse the same code
+        # for equivalent Array structs
         name = self.sregistry.make_name(prefix='alloc')
         body = (decl, *allocs, init0, init1, ret)
         efunc0 = make_callable(name, body, retval=obj)
@@ -208,11 +209,48 @@ class DataManager:
         args[args.index(nbytes_param)] = nbytes_arg
         alloc = Call(name, args, retobj=obj)
 
+        # Same story for the frees
         name = self.sregistry.make_name(prefix='free')
         efunc1 = make_callable(name, frees)
         free = Call(name, efunc1.parameters)
 
         storage.update(obj, site, allocs=alloc, frees=free, efuncs=(efunc0, efunc1))
+
+    def _alloc_bundle_struct_on_high_bw_mem(self, site, obj, storage):
+        """
+        Allocate a Bundle struct in the host high bandwidth memory.
+        """
+        decl = Definition(obj)
+
+        # Allocate the Bundle struct
+        memptr = VOID(Byref(obj._C_symbol), '**')
+        alignment = obj._data_alignment
+        nbytes = SizeOf(obj._C_typedata)
+        alloc = self.lang['host-alloc'](memptr, alignment, nbytes)
+
+        nbytes_param = Symbol(name='nbytes', dtype=np.uint64, is_const=True)
+        nbytes_arg = SizeOf(obj.indexed._C_typedata)*obj.size
+
+        # Initialize the Bundle struct
+        ffp1 = FieldFromPointer(obj._C_field_nbytes, obj._C_symbol)
+        init0 = DummyExpr(ffp1, nbytes_param)
+        ffp2 = FieldFromPointer(obj._C_field_size, obj._C_symbol)
+        init1 = DummyExpr(ffp2, 0)
+
+        free = self.lang['host-free'](obj._C_symbol)
+
+        ret = Return(obj._C_symbol)
+
+        # Wrap everything in a Callable so that we can reuse the same code
+        # for equivalent Bundle structs
+        name = self.sregistry.make_name(prefix='alloc')
+        body = (decl, alloc, init0, init1, ret)
+        efunc0 = make_callable(name, body, retval=obj)
+        args = list(efunc0.parameters)
+        args[args.index(nbytes_param)] = nbytes_arg
+        alloc = Call(name, args, retobj=obj)
+
+        storage.update(obj, site, allocs=alloc, frees=free, efuncs=efunc0)
 
     def _alloc_object_array_on_low_lat_mem(self, site, obj, storage):
         """
@@ -340,9 +378,22 @@ class DataManager:
         for i in FindSymbols().visit(iet):
             if i in defines:
                 continue
+
             elif i.is_LocalObject:
                 self._alloc_object_on_low_lat_mem(iet, i, storage)
-            elif i.is_Array or i.is_Bundle:
+
+            elif i.is_Bundle:
+                if i._mem_heap:
+                    if i.is_transient:
+                        self._alloc_bundle_struct_on_high_bw_mem(iet, i, storage)
+                    elif i._mem_local:
+                        self._alloc_local_array_on_high_bw_mem(iet, i, storage)
+                    elif i._mem_mapped:
+                        self._alloc_mapped_array_on_high_bw_mem(iet, i, storage)
+                elif i._mem_stack:
+                    self._alloc_array_on_low_lat_mem(iet, i, storage)
+
+            elif i.is_Array:
                 if i._mem_heap:
                     if i._mem_host:
                         self._alloc_host_array_on_high_bw_mem(iet, i, storage)
@@ -355,8 +406,10 @@ class DataManager:
                 elif globs is not None:
                     # Track, to be handled by the EntryFunction being a global obj!
                     globs.add(i)
+
             elif i.is_ObjectArray:
                 self._alloc_object_array_on_low_lat_mem(iet, i, storage)
+
             elif i.is_PointerArray:
                 self._alloc_pointed_array_on_high_bw_mem(iet, i, storage)
 
@@ -571,9 +624,12 @@ def make_zero_init(obj, rcompile, sregistry):
         cdims.append(CustomDimension(name=d.name, parent=d,
                                      symbolic_min=m, symbolic_max=M))
 
-    eq = Eq(obj[cdims], 0)
+    if obj.is_Bundle:
+        eqns = [Eq(ComponentAccess(obj[cdims], i), 0) for i in range(obj.ncomp)]
+    else:
+        eqns = [Eq(obj[cdims], 0)]
 
-    irs, byproduct = rcompile(eq)
+    irs, byproduct = rcompile(eqns)
 
     init = irs.iet.body.body[0]
 
@@ -581,6 +637,10 @@ def make_zero_init(obj, rcompile, sregistry):
     efunc = make_callable(name, init)
     init = Call(name, efunc.parameters)
 
-    efuncs = [efunc] + [i.root for i in byproduct.funcs]
+    efuncs = [efunc]
+
+    # Also the called device kernels, if any
+    calls = [i.name for i in FindNodes(Call).visit(efunc)]
+    efuncs.extend([i.root for i in byproduct.funcs if i.root.name in calls])
 
     return efuncs, init
