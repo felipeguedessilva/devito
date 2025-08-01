@@ -1,7 +1,10 @@
 import pytest
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from scipy.misc import ascent
+try:
+    from scipy.datasets import ascent
+except ImportError:
+    from scipy.misc import ascent
 
 from devito import ConditionalDimension, Grid, Function, TimeFunction, switchconfig
 from devito.builtins import (assign, norm, gaussian_smooth, initialize_function,
@@ -152,7 +155,7 @@ class TestGaussianSmooth:
     def test_gs_2d_int(self, sigma):
         """Test the Gaussian smoother in 2d."""
 
-        a = ascent()
+        a = ascent().astype(np.int32)
         sp_smoothed = gaussian_filter(a, sigma=sigma)
         dv_smoothed = gaussian_smooth(a, sigma=sigma)
 
@@ -166,8 +169,7 @@ class TestGaussianSmooth:
     def test_gs_2d_float(self, sigma):
         """Test the Gaussian smoother in 2d."""
 
-        a = ascent()
-        a = a+0.1
+        a = ascent()+0.1
         sp_smoothed = gaussian_filter(a, sigma=sigma)
         dv_smoothed = gaussian_smooth(a, sigma=sigma)
 
@@ -370,6 +372,26 @@ class TestBuiltinsResult:
         rec1.data[:, :] = 1 + np.random.randn(*rec1.shape).astype(grid.dtype)
         term1 = inner(rec0, rec1)
         term2 = np.inner(rec0.data.reshape(-1), rec1.data.reshape(-1))
+        assert np.isclose(term1/term2 - 1, 0.0, rtol=0.0, atol=1e-5)
+
+    @pytest.mark.parametrize('dtype', [
+        np.float32,
+        pytest.param(np.complex64,
+                     marks=pytest.mark.skipif(True, reason='CXXomp real reduction'))])
+    def test_norm_dense(self, dtype):
+        """
+        Test that norm produces the correct result against NumPy
+        """
+        grid = Grid((101, 101), extent=(1000., 1000.))
+
+        f = Function(name='f', grid=grid, dtype=dtype)
+
+        f.data[:] = 1 + np.random.randn(*f.shape).astype(grid.dtype)
+        if np.iscomplexobj(f.data):
+            f.data[:] += 1j*np.random.randn(*f.shape).astype(grid.dtype)
+        term1 = np.linalg.norm(f.data)
+        term2 = norm(f)
+        assert np.isreal(term2)
         assert np.isclose(term1/term2 - 1, 0.0, rtol=0.0, atol=1e-5)
 
     def test_norm_sparse(self):

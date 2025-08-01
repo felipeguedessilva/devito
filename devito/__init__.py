@@ -27,6 +27,7 @@ from devito.symbolics import CondEq, CondNe  # noqa
 from devito.builtins import *  # noqa
 from devito.data.allocators import *  # noqa
 from devito.logger import error, warning, info, set_log_level  # noqa
+from devito.warnings import warn  # noqa
 from devito.mpi import MPI, CustomTopology  # noqa
 try:
     from devito.checkpointing import DevitoCheckpoint, CheckpointOperator  # noqa
@@ -47,16 +48,20 @@ from devito.operator import profiler_registry, operator_registry
 from devito.mpatches import *  # noqa
 
 
-from ._version import get_versions  # noqa
-__version__ = get_versions()['version']
-del get_versions
+from importlib.metadata import version, PackageNotFoundError
+try:
+    __version__ = version("devito")
+except PackageNotFoundError:
+    # devito is not installed
+    __version__ = '0+untagged'
 
 
 def reinit_compiler(val):
     """
     Re-initialize the Compiler.
     """
-    configuration['compiler'].__init__(suffix=configuration['compiler'].suffix,
+    configuration['compiler'].__init__(name=configuration['compiler'].name,
+                                       suffix=configuration['compiler'].suffix,
                                        mpi=configuration['mpi'])
     return val
 
@@ -65,7 +70,7 @@ def reinit_compiler(val):
 configuration.add('platform', 'cpu64', list(platform_registry),
                   callback=lambda i: platform_registry[i]())
 configuration.add('compiler', 'custom', compiler_registry,
-                  callback=lambda i: compiler_registry[i]())
+                  callback=lambda i: compiler_registry[i](name=i))
 
 # Setup language for shared-memory parallelism
 preprocessor = lambda i: {0: 'C', 1: 'openmp'}.get(i, i)  # Handles DEVITO_OPENMP deprec

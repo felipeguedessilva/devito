@@ -17,13 +17,12 @@ except ImportError:
 from devito.finite_differences.tools import make_shift_x0, coeff_priority
 from devito.logger import warning
 from devito.tools import (as_tuple, filter_ordered, flatten, frozendict,
-                          infer_dtype, is_integer, split)
-from devito.types import (Array, DimensionTuple, Evaluable, Indexed,
-                          StencilDimension)
+                          infer_dtype, extract_dtype, is_integer, split, is_number)
+from devito.types import Array, DimensionTuple, Evaluable, StencilDimension
 from devito.types.basic import AbstractFunction
 
 __all__ = ['Differentiable', 'DiffDerivative', 'IndexDerivative', 'EvalDerivative',
-           'Weights']
+           'Weights', 'Real', 'Imag', 'Conj']
 
 
 class Differentiable(sympy.Expr, Evaluable):
@@ -64,6 +63,7 @@ class Differentiable(sympy.Expr, Evaluable):
     @cached_property
     def grid(self):
         grids = {getattr(i, 'grid', None) for i in self._args_diff} - {None}
+        grids = {g.root for g in grids}
         if len(grids) > 1:
             warning("Expression contains multiple grids, returning first found")
         try:
@@ -73,7 +73,7 @@ class Differentiable(sympy.Expr, Evaluable):
 
     @cached_property
     def dtype(self):
-        dtypes = {f.dtype for f in self.find(Indexed)} - {None}
+        dtypes = {f.dtype for f in self._functions} - {None}
         return infer_dtype(dtypes)
 
     @cached_property
@@ -85,6 +85,11 @@ class Differentiable(sympy.Expr, Evaluable):
     def dimensions(self):
         return tuple(filter_ordered(flatten(getattr(i, 'dimensions', ())
                                             for i in self._args_diff)))
+
+    @cached_property
+    def root_dimensions(self):
+        """Tuple of root Dimensions of the physical space Dimensions."""
+        return tuple(d.root for d in self.dimensions if d.is_Space)
 
     @property
     def indices_ref(self):
@@ -317,7 +322,7 @@ class Differentiable(sympy.Expr, Evaluable):
         """
         w = kwargs.get('weights', kwargs.get('w'))
         order = order or self.space_order
-        space_dims = [d for d in self.dimensions if d.is_Space]
+        space_dims = self.root_dimensions
         shift_x0 = make_shift_x0(shift, (len(space_dims),))
         derivs = tuple('d%s2' % d.name for d in space_dims)
         return Add(*[getattr(self, d)(x0=shift_x0(shift, space_dims[i], None, i),
@@ -344,7 +349,7 @@ class Differentiable(sympy.Expr, Evaluable):
             Custom weights for the finite difference coefficients.
         """
         w = kwargs.get('weights', kwargs.get('w'))
-        space_dims = [d for d in self.dimensions if d.is_Space]
+        space_dims = self.root_dimensions
         shift_x0 = make_shift_x0(shift, (len(space_dims),))
         order = order or self.space_order
         return Add(*[getattr(self, 'd%s' % d.name)(x0=shift_x0(shift, d, None, i),
@@ -371,7 +376,7 @@ class Differentiable(sympy.Expr, Evaluable):
             Custom weights for the finite
         """
         from devito.types.tensor import VectorFunction, VectorTimeFunction
-        space_dims = [d for d in self.dimensions if d.is_Space]
+        space_dims = self.root_dimensions
         shift_x0 = make_shift_x0(shift, (len(space_dims),))
         order = order or self.space_order
         w = kwargs.get('weights', kwargs.get('w'))
@@ -387,7 +392,7 @@ class Differentiable(sympy.Expr, Evaluable):
         Generates a symbolic expression for the weighted biharmonic operator w.r.t.
         all spatial Dimensions Laplace(weight * Laplace (self))
         """
-        space_dims = [d for d in self.dimensions if d.is_Space]
+        space_dims = self.root_dimensions
         derivs = tuple('d%s2' % d.name for d in space_dims)
         return Add(*[getattr(self.laplace * weight, d) for d in derivs])
 
@@ -543,20 +548,19 @@ class Mul(DifferentiableOp, sympy.Mul):
         nested, others = split(args, lambda e: isinstance(e, Mul))
         args = flatten(e.args for e in nested) + list(others)
 
+        # Gather all numbers and simplify
+        nums, others = split(args, lambda e: is_number(e))
+        scalar = sympy.Mul(*nums)
+
         # a*0 -> 0
-        if any(i == 0 for i in args):
+        if scalar == 0:
             return sympy.S.Zero
 
         # a*1 -> a
-        args = [i for i in args if i != 1]
-
-        # a*-1 -> a*-1
-        # a*-1*-1 -> a
-        # a*-1*-1*-1 -> a*-1
-        nminus = len([i for i in args if i == sympy.S.NegativeOne])
-        args = [i for i in args if i != sympy.S.NegativeOne]
-        if nminus % 2 == 1:
-            args.append(sympy.S.NegativeOne)
+        if scalar - 1 == 0:
+            args = others
+        else:
+            args = [scalar] + others
 
         # Reorder for homogeneity with pure SymPy types
         _mulsort(args)
@@ -623,6 +627,63 @@ class Mod(DifferentiableOp, sympy.Mod):
     __sympy_class__ = sympy.Mod
 
 
+class SafeInv(Differentiable, sympy.core.function.Application):
+    _fd_priority = 0
+
+    @property
+    def base(self):
+        return self.args[1]
+
+    @property
+    def val(self):
+        return self.args[0]
+
+    def __str__(self):
+        return Pow(self.args[0], -1).__str__()
+
+    __repr__ = __str__
+
+
+class ComplexPart(Differentiable, sympy.core.function.Application):
+    """Abstract class for `Real`, `Imag`, or `Conj` of an expression"""
+    _name = None
+
+    def __new__(cls, *args, **kwargs):
+        if len(args) != 1:
+            raise ValueError(f"{cls.__name__} expects exactly one arg;"
+                             f" {len(args)} were supplied instead.")
+
+        return super().__new__(cls, *args, **kwargs)
+
+    def __str__(self):
+        return f"{self.__class__.__name__}({self.args[0]})"
+
+    __repr__ = __str__
+
+
+class RealComplexPart(ComplexPart):
+
+    @cached_property
+    def dtype(self):
+        dtype = extract_dtype(self)
+        return dtype(0).real.__class__
+
+
+class Real(RealComplexPart):
+    """Get the real part of an expression"""
+    _name = 'real'
+
+
+class Imag(RealComplexPart):
+    """Get the imaginary part of an expression"""
+    _name = 'imag'
+
+
+class Conj(ComplexPart):
+    """Get the complex conjugate of an expression"""
+    _name = 'conj'
+
+
 class IndexSum(sympy.Expr, Evaluable):
 
     """
@@ -674,6 +735,8 @@ class IndexSum(sympy.Expr, Evaluable):
 
     def _sympystr(self, printer):
         return str(self)
+
+    _latex = _sympystr
 
     def _hashable_content(self):
         return super()._hashable_content() + (self.dimensions,)
@@ -729,6 +792,12 @@ class Weights(Array):
         kwargs['initvalue'] = weights
 
         super().__init_finalize__(*args, **kwargs)
+
+    @classmethod
+    def class_key(cls):
+        # Ensure Weights appear before any other AbstractFunction
+        p, v, _ = Array.class_key()
+        return p, v - 1, cls.__name__
 
     def __eq__(self, other):
         return (isinstance(other, Weights) and
@@ -819,7 +888,8 @@ class IndexDerivative(IndexSum):
         n1 = self.__class__
         n2 = other.__class__
         if n1.__name__ == n2.__name__:
-            return self.base.compare(other.base)
+            return (self.weights.compare(other.weights) or
+                    self.base.compare(other.base))
         else:
             return super().compare(other)
 
@@ -1024,7 +1094,7 @@ def interp_for_fd(expr, x0, **kwargs):
 @interp_for_fd.register(sympy.Derivative)
 def _(expr, x0, **kwargs):
     x0_expr = {d: v for d, v in x0.items() if d not in expr.dims}
-    return expr.func(expr=interp_for_fd(expr.expr, x0_expr, **kwargs))
+    return expr.func(interp_for_fd(expr.expr, x0_expr, **kwargs))
 
 
 @interp_for_fd.register(sympy.Expr)

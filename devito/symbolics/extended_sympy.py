@@ -1,16 +1,18 @@
 """
 Extended SymPy hierarchy.
 """
+import re
 
 import numpy as np
 import sympy
-from sympy import Expr, Function, Number, Tuple, sympify
+from sympy import Expr, Function, Number, Tuple, cacheit, sympify
 from sympy.core.decorators import call_highest_priority
 
 from devito.finite_differences.elementary import Min, Max
 from devito.tools import (Pickable, Bunch, as_tuple, is_integer, float2,  # noqa
                           float3, float4, double2, double3, double4, int2, int3,
-                          int4)
+                          int4, dtype_to_ctype, ctypes_to_cstr, ctypes_vector_mapper,
+                          ctypes_to_cstr)
 from devito.types import Symbol
 from devito.types.basic import Basic
 
@@ -18,9 +20,9 @@ __all__ = ['CondEq', 'CondNe', 'IntDiv', 'CallFromPointer',  # noqa
            'CallFromComposite', 'FieldFromPointer', 'FieldFromComposite',
            'ListInitializer', 'Byref', 'IndexedPointer', 'Cast', 'DefFunction',
            'MathFunction', 'InlineIf', 'ReservedWord', 'Keyword', 'String',
-           'Macro', 'Class', 'MacroArgument', 'CustomType', 'Deref', 'Namespace',
-           'Rvalue', 'INT', 'FLOAT', 'DOUBLE', 'VOID', 'Null', 'SizeOf', 'rfunc',
-           'cast_mapper', 'BasicWrapperMixin', 'ValueLimit', 'limits_mapper']
+           'Macro', 'Class', 'MacroArgument', 'Deref', 'Namespace',
+           'Rvalue', 'Null', 'SizeOf', 'rfunc', 'BasicWrapperMixin', 'ValueLimit',
+           'VectorAccess']
 
 
 class CondEq(sympy.Eq):
@@ -83,16 +85,16 @@ class IntDiv(sympy.Expr):
     def __new__(cls, lhs, rhs, params=None):
         if rhs == 0:
             raise ValueError("Cannot divide by 0")
-        elif rhs == 1:
+        elif rhs == 1 or rhs is None:
             return lhs
 
         if not is_integer(rhs):
             # Perhaps it's a symbolic RHS -- but we wanna be sure it's of type int
             if not hasattr(rhs, 'dtype'):
-                raise ValueError("Symbolic RHS `%s` lacks dtype" % rhs)
+                raise ValueError(f"Symbolic RHS `{rhs}` lacks dtype")
             if not issubclass(rhs.dtype, np.integer):
-                raise ValueError("Symbolic RHS `%s` must be of type `int`, found "
-                                 "`%s` instead" % (rhs, rhs.dtype))
+                raise ValueError(f"Symbolic RHS `{rhs}` must be of type `int`, found "
+                                 f"`{rhs.dtype}` instead")
         rhs = sympify(rhs)
 
         obj = sympy.Expr.__new__(cls, lhs, rhs)
@@ -103,7 +105,7 @@ class IntDiv(sympy.Expr):
         return obj
 
     def __str__(self):
-        return "IntDiv(%s, %s)" % (self.lhs, self.rhs)
+        return f"IntDiv({self.lhs}, {self.rhs})"
 
     __repr__ = __str__
 
@@ -147,7 +149,10 @@ class BasicWrapperMixin:
         """
         Overridden SymPy assumption -- now based on the wrapped object dtype.
         """
-        return issubclass(self.dtype, np.number)
+        try:
+            return issubclass(self.dtype, np.number)
+        except TypeError:
+            return self.dtype in ctypes_vector_mapper
 
     def _sympystr(self, printer):
         return str(self)
@@ -191,8 +196,8 @@ class CallFromPointer(sympy.Expr, Pickable, BasicWrapperMixin):
         return obj
 
     def __str__(self):
-        return '%s->%s(%s)' % (self.pointer, self.call,
-                               ", ".join(str(i) for i in as_tuple(self.params)))
+        params = ", ".join(str(i) for i in as_tuple(self.params))
+        return f'{self.pointer}->{self.call}({params})'
 
     __repr__ = __str__
 
@@ -228,8 +233,8 @@ class CallFromComposite(CallFromPointer, Pickable):
     """
 
     def __str__(self):
-        return '%s.%s(%s)' % (self.pointer, self.call,
-                              ", ".join(str(i) for i in as_tuple(self.params)))
+        params = ", ".join(str(i) for i in as_tuple(self.params))
+        return f'{self.pointer}.{self.call}({params})'
 
     __repr__ = __str__
 
@@ -246,7 +251,7 @@ class FieldFromPointer(CallFromPointer, Pickable):
         return CallFromPointer.__new__(cls, field, pointer)
 
     def __str__(self):
-        return '%s->%s' % (self.pointer, self.field)
+        return f'{self.pointer}->{self.field}'
 
     @property
     def field(self):
@@ -268,7 +273,7 @@ class FieldFromComposite(CallFromPointer, Pickable):
         return CallFromPointer.__new__(cls, field, composite)
 
     def __str__(self):
-        return '%s.%s' % (self.composite, self.field)
+        return f'{self.composite}.{self.field}'
 
     @property
     def field(self):
@@ -288,20 +293,24 @@ class ListInitializer(sympy.Expr, Pickable):
     """
 
     __rargs__ = ('params',)
+    __rkwargs__ = ('dtype',)
 
-    def __new__(cls, params):
+    def __new__(cls, params, dtype=None):
         args = []
         for p in as_tuple(params):
             try:
                 args.append(sympify(p))
             except sympy.SympifyError:
-                raise ValueError("Illegal param `%s`" % p)
+                raise ValueError(f"Illegal param `{p}`")
         obj = sympy.Expr.__new__(cls, *args)
+
         obj.params = tuple(args)
+        obj.dtype = dtype
+
         return obj
 
     def __str__(self):
-        return "{%s}" % ", ".join(str(i) for i in self.params)
+        return f"{{{', '.join(str(i) for i in self.params)}}}"
 
     __repr__ = __str__
 
@@ -349,9 +358,9 @@ class UnaryOp(sympy.Expr, Pickable, BasicWrapperMixin):
 
     def __str__(self):
         if self.base.is_Symbol:
-            return "%s%s" % (self._op, str(self.base))
+            return f'{self._op}{self.base}'
         else:
-            return "%s(%s)" % (self._op, str(self.base))
+            return f'{self._op}({self.base})'
 
     __repr__ = __str__
 
@@ -383,25 +392,39 @@ class Cast(UnaryOp):
     Symbolic representation of the C notation `(type)expr`.
     """
 
-    _base_typ = ''
+    __rargs__ = ('base', )
+    __rkwargs__ = ('dtype', 'stars', 'reinterpret')
 
-    __rkwargs__ = ('stars',)
-
-    def __new__(cls, base, stars=None, **kwargs):
-        # Attempt simplifcation
-        # E.g., `FLOAT(32) -> 32.0` of type `sympy.Float`
+    def __new__(cls, base, dtype=None, stars=None, reinterpret=False, **kwargs):
         try:
-            return sympify(eval(cls._base_typ)(base))
-        except (NameError, SyntaxError):
-            # E.g., `_base_typ` is "char" or "unsigned long"
-            pass
+            if issubclass(dtype, np.generic) and sympify(base).is_Number:
+                base = sympify(dtype(base))
         except TypeError:
-            # `base` ain't a number
+            # E.g. void
             pass
+
+        dtype, stars = cls._process_dtype(dtype, stars)
 
         obj = super().__new__(cls, base)
-        obj._stars = stars
+        obj._stars = stars or ''
+        obj._dtype = dtype
+        obj._reinterpret = reinterpret
+
         return obj
+
+    @classmethod
+    def _process_dtype(cls, dtype, stars):
+        if not isinstance(dtype, str) or stars is not None:
+            return dtype, stars
+
+        # String dtype, e.g. "float", "int*", "foo**"
+        match = re.fullmatch(r'(\w+)\s*(\*+)?', dtype)
+        if match:
+            dtype = match.group(1)
+            stars = match.group(2) or ''
+            return dtype, stars
+        else:
+            return dtype, stars
 
     def _hashable_content(self):
         return super()._hashable_content() + (self._stars,)
@@ -413,12 +436,28 @@ class Cast(UnaryOp):
         return self._stars
 
     @property
-    def typ(self):
-        return '%s%s' % (self._base_typ, self.stars or '')
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def reinterpret(self):
+        return self._reinterpret
+
+    @property
+    def _C_ctype(self):
+        ctype = ctypes_vector_mapper.get(self.dtype, self.dtype)
+        try:
+            ctype = dtype_to_ctype(ctype)
+        except TypeError:
+            pass
+        return ctype
 
     @property
     def _op(self):
-        return '(%s)' % self.typ
+        return f'({ctypes_to_cstr(self._C_ctype)}{self.stars})'
+
+    def __str__(self):
+        return f"{self._op}{self.base}"
 
 
 class IndexedPointer(sympy.Expr, Pickable, BasicWrapperMixin):
@@ -440,9 +479,9 @@ class IndexedPointer(sympy.Expr, Pickable, BasicWrapperMixin):
             if not isinstance(base, sympy.Basic):
                 raise ValueError("`base` must be of type sympy.Basic")
 
-        index = tuple(sympify(i) for i in as_tuple(index))
+        index = Tuple(*[sympify(i) for i in as_tuple(index)])
 
-        obj = sympy.Expr.__new__(cls, base, *index)
+        obj = sympy.Expr.__new__(cls, base, index)
         obj._base = base
         obj._index = index
 
@@ -457,7 +496,8 @@ class IndexedPointer(sympy.Expr, Pickable, BasicWrapperMixin):
         return self._index
 
     def __str__(self):
-        return "%s%s" % (self.base, ''.join('[%s]' % i for i in self.index))
+        indices = ''.join(f'[{i}]' for i in self.index)
+        return f"{self.base}{indices}"
 
     __repr__ = __str__
 
@@ -484,7 +524,7 @@ class ReservedWord(sympy.Atom, Pickable):
 
     def __new__(cls, value, **kwargs):
         if not isinstance(value, str):
-            raise TypeError("Expected str, got `%s`" % type(value))
+            raise TypeError(f"Expected str, got `{type(value)}`")
         obj = sympy.Atom.__new__(cls, **kwargs)
         obj.value = value
 
@@ -509,10 +549,6 @@ class Keyword(ReservedWord):
     pass
 
 
-class CustomType(ReservedWord):
-    pass
-
-
 class String(ReservedWord):
     pass
 
@@ -524,7 +560,7 @@ class Macro(ReservedWord):
 class Class(ReservedWord):
 
     def __str__(self):
-        return "class %s" % self.value
+        return f"class {self.value}"
 
     __repr__ = __str__
 
@@ -532,7 +568,7 @@ class Class(ReservedWord):
 class MacroArgument(sympy.Symbol):
 
     def __str__(self):
-        return "(%s)" % self.name
+        return f"({self.name})"
 
     __repr__ = __str__
 
@@ -545,14 +581,6 @@ class ValueLimit(ReservedWord, sympy.Expr):
     """
 
     pass
-
-
-limits_mapper = {
-    np.int32: Bunch(min=ValueLimit('INT_MIN'), max=ValueLimit('INT_MAX')),
-    np.int64: Bunch(min=ValueLimit('LONG_MIN'), max=ValueLimit('LONG_MAX')),
-    np.float32: Bunch(min=-ValueLimit('FLT_MAX'), max=ValueLimit('FLT_MAX')),
-    np.float64: Bunch(min=-ValueLimit('DBL_MAX'), max=ValueLimit('DBL_MAX')),
-}
 
 
 class DefFunction(Function, Pickable):
@@ -599,6 +627,10 @@ class DefFunction(Function, Pickable):
 
         return obj
 
+    def _eval_is_commutative(self):
+        # DefFunction defaults to commutative
+        return True
+
     @property
     def name(self):
         return self._name
@@ -613,11 +645,11 @@ class DefFunction(Function, Pickable):
 
     def __str__(self):
         if self.template:
-            template = '<%s>' % ','.join(str(i) for i in self.template)
+            template = f"<{','.join(str(i) for i in self.template)}>"
         else:
             template = ''
         arguments = ', '.join(str(i) for i in self.arguments)
-        return "%s%s(%s)" % (self.name, template, arguments)
+        return f"{self.name}{template}({arguments})"
 
     __repr__ = __str__
 
@@ -670,7 +702,7 @@ class InlineIf(sympy.Expr, Pickable):
         return self._false_expr
 
     def __str__(self):
-        return "(%s) ? %s : %s" % (self.cond, self.true_expr, self.false_expr)
+        return f"({self.cond}) ? {self.true_expr} : {self.false_expr}"
 
     __repr__ = __str__
 
@@ -754,125 +786,73 @@ class Rvalue(sympy.Expr, Pickable):
     def __str__(self):
         rvalue = str(self.expr)
         if self.namespace:
-            rvalue = "%s::%s" % (self.namespace, rvalue)
+            rvalue = f"{self.namespace}::{rvalue}"
         if self.init:
-            rvalue = "%s%s" % (rvalue, self.init)
+            rvalue = f"{rvalue}{self.init}"
         return rvalue
 
     __repr__ = __str__
 
 
-# *** Casting
+class VectorAccess(Expr, Pickable, BasicWrapperMixin):
 
-class CastStar:
+    """
+    Represent a vector access operation at high-level.
+    """
 
-    base = None
+    def __new__(cls, *args, **kwargs):
+        return Expr.__new__(cls, *args)
 
-    def __new__(cls, base=''):
-        return cls.base(base, '*')
+    def __str__(self):
+        return f"VL<{self.base}>"
 
+    __repr__ = __str__
 
-# Dynamically create INT, INT2, .... INTP, INT2P, ... FLOAT, ...
-for base_name in ['int', 'float', 'double']:
-    for i in ['', '2', '3', '4']:
-        v = '%s%s' % (base_name, i)
-        cls = type(v.upper(), (Cast,), {'_base_typ': v})
-        globals()[cls.__name__] = cls
+    func = Pickable._rebuild
 
-        clsp = type('%sP' % v.upper(), (CastStar,), {'base': cls})
-        globals()[clsp.__name__] = clsp
+    @property
+    def base(self):
+        return self.args[0]
 
+    @property
+    def indices(self):
+        return self.base.indices
 
-class CHAR(Cast):
-    _base_typ = 'char'
-
-
-class SHORT(Cast):
-    _base_typ = 'short'
-
-
-class USHORT(Cast):
-    _base_typ = 'unsigned short'
-
-
-class UCHAR(Cast):
-    _base_typ = 'unsigned char'
-
-
-class UINT(Cast):
-    _base_typ = 'unsigned int'
-
-
-class UINTP(CastStar):
-    base = UINT
-
-
-class LONG(Cast):
-    _base_typ = 'long'
-
-
-class ULONG(Cast):
-    _base_typ = 'unsigned long'
-
-
-class VOID(Cast):
-    _base_typ = 'void'
-
-
-class CHARP(CastStar):
-    base = CHAR
-
-
-class UCHARP(CastStar):
-    base = UCHAR
-
-
-class SHORTP(CastStar):
-    base = SHORT
-
-
-class USHORTP(CastStar):
-    base = USHORT
-
-
-cast_mapper = {
-    np.int8: CHAR,
-    np.uint8: UCHAR,
-    np.int16: SHORT,  # noqa
-    np.uint16: USHORT,  # noqa
-    int: INT,  # noqa
-    np.int32: INT,  # noqa
-    np.int64: LONG,
-    np.uint64: ULONG,
-    np.float32: FLOAT,  # noqa
-    float: DOUBLE,  # noqa
-    np.float64: DOUBLE,  # noqa
-
-    (np.int8, '*'): CHARP,
-    (np.uint8, '*'): UCHARP,
-    (int, '*'): INTP,  # noqa
-    (np.uint16, '*'): USHORTP,  # noqa
-    (np.int16, '*'): SHORTP,  # noqa
-    (np.int32, '*'): INTP,  # noqa
-    (np.int64, '*'): INTP,  # noqa
-    (np.float32, '*'): FLOATP,  # noqa
-    (float, '*'): DOUBLEP,  # noqa
-    (np.float64, '*'): DOUBLEP  # noqa
-}
-
-for base_name in ['int', 'float', 'double']:
-    for i in [2, 3, 4]:
-        v = '%s%d' % (base_name, i)
-        cls = locals()[v]
-        cast_mapper[cls] = locals()[v.upper()]
-        cast_mapper[(cls, '*')] = locals()['%sP' % v.upper()]
+    @cacheit
+    def sort_key(self, order=None):
+        # Ensure that the VectorAccess is sorted as the base
+        return self.base.sort_key(order=order)
 
 
 # Some other utility objects
 Null = Macro('NULL')
 
+
 # DefFunction, unlike sympy.Function, generates e.g. `sizeof(float)`, not `sizeof(float_)`
-SizeOf = lambda *args: DefFunction('sizeof', tuple(args))
+class SizeOf(DefFunction):
+
+    __rargs__ = ('intype', 'stars')
+
+    def __new__(cls, intype, stars=None, **kwargs):
+        stars = stars or ''
+        if not isinstance(intype, (str, ReservedWord)):
+            ctype = dtype_to_ctype(intype)
+            for k, v in ctypes_vector_mapper.items():
+                if ctype is v:
+                    intype = k
+                    break
+            else:
+                intype = ctypes_to_cstr(ctype)
+
+        newobj = super().__new__(cls, 'sizeof', arguments=f'{intype}{stars}', **kwargs)
+        newobj.stars = stars
+        newobj.intype = intype
+
+        return newobj
+
+    @property
+    def args(self):
+        return super().args[1]
 
 
 def rfunc(func, item, *args):

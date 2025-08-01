@@ -2,8 +2,9 @@ from functools import wraps, partial
 from itertools import product
 
 import numpy as np
-from sympy import S, finite_diff_weights, cacheit, sympify, Function, Rational
+from sympy import S, finite_diff_weights, cacheit, sympify, Rational, Expr
 
+from devito.logger import warning
 from devito.tools import Tag, as_tuple
 from devito.types.dimension import StencilDimension
 
@@ -91,8 +92,8 @@ def generate_fd_shortcuts(dims, so, to=0):
         dims = as_tuple(dims)
         deriv_order = as_tuple(deriv_order)
         fd_order = as_tuple(fd_order)
-        for (d, do, fo) in zip(dims, deriv_order, fd_order):
-            expr = Derivative(expr, d, deriv_order=do, fd_order=fo, side=side, **kwargs)
+        expr = Derivative(expr, *dims, deriv_order=deriv_order, fd_order=fd_order,
+                          side=side, **kwargs)
         return expr
 
     all_combs = dim_with_order(dims, orders)
@@ -260,6 +261,17 @@ def generate_indices(expr, dim, order, side=None, matvec=None, x0=None, nweights
     -------
     An IndexSet, representing an ordered list of indices.
     """
+    # Check size of input weights
+    if nweights > 0:
+        do, dw = order + 1 + order % 2, nweights
+        if do < dw:
+            raise ValueError(f"More weights ({nweights}) provided than the maximum "
+                             f"stencil size ({order + 1}) for order {order} scheme")
+        elif do > dw:
+            order = nweights - nweights % 2
+            warning(f"Less weights ({nweights}) provided than the stencil size"
+                    f"({order + 1}) for order {order} scheme."
+                    f" Reducing order to {order}")
     # Evaluation point
     x0 = sympify(((x0 or {}).get(dim) or expr.indices_ref[dim]))
 
@@ -276,23 +288,15 @@ def generate_indices(expr, dim, order, side=None, matvec=None, x0=None, nweights
     side = side or centered
 
     # Indices range
-    o_min = int(np.ceil(mid - order/2)) + side.val
-    o_max = int(np.floor(mid + order/2)) + side.val
+    r = (nweights or order) / 2
+    o_min = int(np.ceil(mid - r)) + side.val
+    o_max = int(np.floor(mid + r)) + side.val
     if o_max == o_min:
         if dim.is_Time or not expr.is_Staggered:
             o_max += 1
         else:
             o_min -= 1
 
-    if nweights > 0 and (o_max - o_min + 1) != nweights:
-        # We cannot infer how the stencil should be centered
-        # if nweights is more than one extra point.
-        assert nweights == (o_max - o_min + 1) + 1
-        # In the "one extra" case  we need to pad with one point to symmetrize
-        if (o_max - mid) > (mid - o_min):
-            o_min -= 1
-        else:
-            o_max += 1
     # StencilDimension and expression
     d = make_stencil_dimension(expr, o_min, o_max)
     iexpr = expr.indices_ref[dim] + d * dim.spacing
@@ -322,17 +326,25 @@ def make_shift_x0(shift, ndim):
 
 
 def process_weights(weights, expr, dim):
+    from devito.symbolics import retrieve_functions
     if weights is None:
         return 0, None, False
-    elif isinstance(weights, Function):
+    elif isinstance(weights, Expr):
+        w_func = retrieve_functions(weights)
+        assert len(w_func) == 1, "Only one function expected in weights"
+        weights = w_func[0]
         if len(weights.dimensions) == 1:
             return weights.shape[0], weights.dimensions[0], False
-        wdim = {d for d in weights.dimensions if d not in expr.dimensions}
+        try:
+            # Already a derivative
+            wdim = {d for d in weights.dimensions if d not in expr.base.dimensions}
+        except AttributeError:
+            wdim = {d for d in weights.dimensions if d not in expr.dimensions}
         assert len(wdim) == 1
         wdim = wdim.pop()
         shape = weights.shape
         return shape[weights.dimensions.index(wdim)], wdim, False
     else:
         # Adimensional weight from custom coeffs need to be multiplied by h^order
-        scale = not all(sympify(w).has(dim.spacing) for w in weights if w != 0)
+        scale = all(sympify(w).is_Number for w in weights)
         return len(list(weights)), None, scale

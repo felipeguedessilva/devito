@@ -59,7 +59,7 @@ def cross_derivative(expr, dims, fd_order, deriv_order, x0=None, side=None, **kw
     Semantically, this is equivalent to
 
     >>> (f*g).dxdy
-    Derivative(Derivative(f(x, y)*g(x, y), x), y)
+    Derivative(f(x, y)*g(x, y), x, y)
 
     The only difference is that in the latter case derivatives remain unevaluated.
     The expanded form is obtained via ``evaluate``
@@ -158,11 +158,17 @@ def make_derivative(expr, dim, fd_order, deriv_order, side, matvec, x0, coeffici
     # `coefficients` method (`taylor` or `symbolic`)
     if weights is None:
         weights = fd_weights_registry[coefficients](expr, deriv_order, indices, x0)
-    elif wdim is not None:
+    # Did fd_weights_registry return a new Function/Expression instead of a values?
+    _, wdim, _ = process_weights(weights, expr, dim)
+    if wdim is not None:
         weights = [weights._subs(wdim, i) for i in range(len(indices))]
 
     # Enforce fixed precision FD coefficients to avoid variations in results
-    weights = [sympify(w).evalf(_PRECISION) for w in weights]
+    if scale:
+        scale = dim.spacing**(-deriv_order)
+    else:
+        scale = 1
+    weights = [sympify(scale * w).evalf(_PRECISION) for w in weights]
 
     # Transpose the FD, if necessary
     if matvec == transpose:
@@ -207,8 +213,5 @@ def make_derivative(expr, dim, fd_order, deriv_order, side, matvec, x0, coeffici
             terms.append(term)
 
         deriv = EvalDerivative(*terms, base=expr)
-
-    if scale:
-        deriv = dim.spacing**(-deriv_order) * deriv
 
     return deriv

@@ -6,13 +6,14 @@ from devito.tools import as_tuple, is_integer
 from devito.types.basic import AbstractFunction
 from devito.types.constant import Constant
 from devito.types.dimension import Dimension
+from devito.types.array import ComponentAccess
 from devito.types.object import AbstractObject
 
 
 __all__ = ['q_leaf', 'q_indexed', 'q_terminal', 'q_function', 'q_routine',
            'q_terminalop', 'q_indirect', 'q_constant', 'q_affine', 'q_linear',
-           'q_identity', 'q_symbol', 'q_multivar', 'q_monoaffine', 'q_dimension',
-           'q_positive', 'q_negative']
+           'q_identity', 'q_symbol', 'q_comp_acc', 'q_multivar', 'q_monoaffine',
+           'q_dimension', 'q_positive', 'q_negative']
 
 
 # The following SymPy objects are considered tree leaves:
@@ -31,10 +32,17 @@ def q_symbol(expr):
         return False
 
 
+def q_comp_acc(expr):
+    return isinstance(expr, ComponentAccess)
+
+
 def q_leaf(expr):
-    return (expr.is_Atom or
-            expr.is_Indexed or
-            isinstance(expr, extra_leaves))
+    try:
+        return (expr.is_Atom or
+                expr.is_Indexed or
+                isinstance(expr, extra_leaves))
+    except AttributeError:
+        return False
 
 
 def q_indexed(expr):

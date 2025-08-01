@@ -109,7 +109,7 @@ def test_default_algo(exprs, expected, min_cost):
         exprs[i] = DummyEq(indexify(diffify(eval(e).evaluate)))
 
     counter = generator()
-    make = lambda: CTemp(name='r%d' % counter()).indexify()
+    make = lambda _: CTemp(name='r%d' % counter()).indexify()
     processed = _cse(exprs, make, min_cost)
 
     assert len(processed) == len(expected)
@@ -241,8 +241,31 @@ def test_advanced_algo(exprs, expected):
         exprs[i] = DummyEq(indexify(diffify(eval(e).evaluate)))
 
     counter = generator()
-    make = lambda: CTemp(name='r%d' % counter(), dtype=np.float32).indexify()
+    make = lambda _: CTemp(name='r%d' % counter(), dtype=np.float32).indexify()
     processed = _cse(exprs, make, mode='advanced')
 
     assert len(processed) == len(expected)
     assert all(str(i.rhs) == j for i, j in zip(processed, expected))
+
+
+def test_advanced_algo_order():
+    """
+    Test that smartsort/advanced doesn't break equation order.
+    """
+    grid = Grid((3, 3, 3))
+    u = TimeFunction(name="u", grid=grid, space_order=2)
+    v = TimeFunction(name="v", grid=grid, space_order=2)
+
+    eq0 = DummyEq(indexify(diffify(Eq(u.forward, u.dx).evaluate)))
+    eq1 = DummyEq(indexify(diffify(Eq(v, u.dx).evaluate)))
+    eq_b = DummyEq(indexify(diffify(Eq(v.forward, v + u.forward).evaluate)))
+
+    counter = generator()
+    make = lambda _: CTemp(name='r%d' % counter(), dtype=np.float32).indexify()
+    processed = _cse([eq0, eq1, eq_b], make, mode='advanced')
+
+    # Three input equation and 2 CTemps
+    assert len(processed) == 5
+    assert processed[0].lhs.name == 'r1'
+    # eq_b has to be last
+    assert processed[-1] == eq_b

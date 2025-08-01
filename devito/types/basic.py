@@ -1,7 +1,7 @@
 import abc
 import inspect
 from collections import namedtuple
-from ctypes import POINTER, _Pointer, c_char_p, c_char
+from ctypes import POINTER, _Pointer, c_char_p, c_char, Structure
 from functools import reduce, cached_property
 from operator import mul
 
@@ -13,8 +13,8 @@ from sympy.core.decorators import call_highest_priority
 
 from devito.data import default_allocator
 from devito.parameters import configuration
-from devito.tools import (Pickable, as_tuple, ctypes_to_cstr, dtype_to_ctype,
-                          frozendict, memoized_meth, sympy_mutex)
+from devito.tools import (Pickable, as_tuple, dtype_to_ctype,
+                          frozendict, memoized_meth, sympy_mutex, CustomDtype)
 from devito.types.args import ArgProvider
 from devito.types.caching import Cached, Uncached
 from devito.types.lazy import Evaluable
@@ -42,7 +42,8 @@ class CodeSymbol:
         * "liveness": `_mem_external`, `_mem_internal_eager`, `_mem_internal_lazy`
         * "space": `_mem_local`, `_mem_mapped`, `_mem_host`
         * "scope": `_mem_stack`, `_mem_heap`, `_mem_global`, `_mem_shared`,
-                   `_mem_constant`
+                   `_mem_shared_remote`, `_mem_constant`, `_mem_registers`,
+                   `_mem_rvalue`
 
     For example, an object that is `<_mem_internal_lazy, _mem_local, _mem_heap>`
     is allocated within the Operator entry point, on either the host or device
@@ -67,7 +68,8 @@ class CodeSymbol:
         """
         return
 
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def _C_name(self):
         """
         The name of the object in the generated code.
@@ -81,9 +83,12 @@ class CodeSymbol:
     @property
     def _C_typedata(self):
         """
-        The type of the object in the generated code as a `str`.
+        The type of the object's data in the generated code.
         """
         _type = self._C_ctype
+        if isinstance(_type, CustomDtype):
+            return _type
+
         while issubclass(_type, _Pointer):
             _type = _type._type_
 
@@ -91,9 +96,18 @@ class CodeSymbol:
         if _type is c_char_p:
             _type = c_char
 
-        return ctypes_to_cstr(_type)
+        try:
+            # We have internal types such as c_complex that are
+            # Structure too but should be treated as plain c_type
+            _type._base_dtype
+        except AttributeError:
+            if issubclass(_type, Structure):
+                _type = f'struct {_type.__name__}'
 
-    @abc.abstractproperty
+        return _type
+
+    @property
+    @abc.abstractmethod
     def _C_ctype(self):
         """
         The type of the object in the generated code as a `ctypes` class.
@@ -208,6 +222,29 @@ class CodeSymbol:
         """
         True if the associated data is allocated in so called shared memory,
         False otherwise.
+        """
+        return False
+
+    @property
+    def _mem_shared_remote(self):
+        """
+        True if the associated data is allocated in so called remote shared
+        memory, False otherwise.
+        """
+        return False
+
+    @property
+    def _mem_registers(self):
+        """
+        True if the associated data is allocated in registers, False otherwise.
+        """
+        return False
+
+    @property
+    def _mem_rvalue(self):
+        """
+        True if the associated data is allocated in a temporary (or "transient")
+        variable, such as rvalues in CXX, False otherwise.
         """
         return False
 
@@ -330,8 +367,6 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable, Evaluable):
     is_Symbol = True
 
     # SymPy default assumptions
-    is_real = True
-    is_imaginary = False
     is_commutative = True
 
     __rkwargs__ = ('name', 'dtype', 'is_const')
@@ -351,13 +386,24 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable, Evaluable):
 
         return assumptions, kwargs
 
+    @staticmethod
+    def __xnew__(cls, name, **assumptions):
+        # Create the new Symbol
+        # Note: use __xnew__ to bypass sympy caching
+        newobj = sympy.Symbol.__xnew__(cls, name, **assumptions)
+
+        assumptions = newobj._assumptions.copy()
+        for key in ('real', 'imaginary', 'complex'):
+            assumptions.pop(key, None)
+        newobj._assumptions = assumptions
+
+        return newobj
+
     def __new__(cls, *args, **kwargs):
         name = kwargs.get('name') or args[0]
         assumptions, kwargs = cls._filter_assumptions(**kwargs)
 
-        # Create the new Symbol
-        # Note: use __xnew__ to bypass sympy caching
-        newobj = sympy.Symbol.__xnew__(cls, name, **assumptions)
+        newobj = cls.__xnew__(cls, name, **assumptions)
 
         # Initialization
         newobj._dtype = cls.__dtype_setup__(**kwargs)
@@ -391,6 +437,17 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable, Evaluable):
     @property
     def dtype(self):
         return self._dtype
+
+    def _eval_is_real(self):
+        return not self.is_imaginary
+
+    def _eval_is_imaginary(self):
+        try:
+            return np.iscomplexobj(self.dtype(0))
+        except TypeError:
+            # Non-callabale dtype, likely non-numpy
+            # Assuming it's not complex
+            return False
 
     @property
     def indices(self):
@@ -510,9 +567,7 @@ class Symbol(AbstractSymbol, Cached):
         # Not in cache. Create a new Symbol via sympy.Symbol
         args = list(args)
         name = kwargs.pop('name', None) or args.pop(0)
-
-        # Note: use __xnew__ to bypass sympy caching
-        newobj = sympy.Symbol.__xnew__(cls, name, **assumptions)
+        newobj = cls.__xnew__(cls, name, **assumptions)
 
         # Initialization
         newobj._dtype = cls.__dtype_setup__(**kwargs)
@@ -531,21 +586,6 @@ class DataSymbol(AbstractSymbol, Uncached, ArgProvider):
     """
     A unique scalar symbol that carries data.
     """
-
-    def __new__(cls, *args, **kwargs):
-        # Create a new Symbol via sympy.Symbol
-        name = kwargs.get('name') or args[0]
-        assumptions, kwargs = cls._filter_assumptions(**kwargs)
-
-        # Note: use __xnew__ to bypass sympy caching
-        newobj = sympy.Symbol.__xnew__(cls, name, **assumptions)
-
-        # Initialization
-        newobj._dtype = cls.__dtype_setup__(**kwargs)
-        newobj.__init_finalize__(*args, **kwargs)
-
-        return newobj
-
     __hash__ = Uncached.__hash__
 
 
@@ -597,195 +637,6 @@ class Scalar(Symbol, ArgProvider):
             return self._arg_defaults(**kwargs)
 
 
-class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
-
-    """
-    Base class for vector and tensor valued functions. It inherits from and
-    mimicks the behavior of a sympy.ImmutableDenseMatrix.
-
-
-    The sub-hierachy is as follows
-
-                         AbstractTensor
-                                |
-                          TensorFunction
-                                |
-                 ---------------------------------
-                 |                               |
-          VectorFunction                 TensorTimeFunction
-                        \\-------\\              |
-                                 \\------- VectorTimeFunction
-
-    There are four relevant AbstractTensor sub-types: ::
-
-        * TensorFunction: A space-varying tensor valued function.
-        * VectorFunction: A space-varying vector valued function.
-        * TensorTimeFunction: A time-space-varying tensor valued function.
-        * VectorTimeFunction: A time-space-varying vector valued function.
-    """
-
-    # SymPy attributes
-    is_MatrixLike = True
-    is_Matrix = True
-
-    # Devito attributes
-    is_AbstractTensor = True
-    is_TensorValued = True
-    is_VectorValued = False
-
-    @classmethod
-    def _new(cls, *args, **kwargs):
-        if args:
-            try:
-                # Constructor if input is (rows, cols, lambda)
-                newobj = super()._new(*args)
-            except ValueError:
-                # Constructor if input is list of list as (row, cols, list_of_list)
-                # doesn't work as it expects a flattened.
-                newobj = super()._new(args[2])
-
-            # Filter grid and dimensions
-            grid, dimensions = newobj._infer_dims()
-            if grid is None and dimensions is None:
-                return sympy.ImmutableDenseMatrix(*args)
-            # Initialized with constructed object
-            newobj.__init_finalize__(newobj.rows, newobj.cols, newobj.flat(),
-                                     grid=grid, dimensions=dimensions)
-        else:
-            # Initialize components and create new Matrix from standard
-            # Devito inputs
-            comps = cls.__subfunc_setup__(*args, **kwargs)
-            newobj = super()._new(comps)
-            newobj.__init_finalize__(*args, **kwargs)
-
-        return newobj
-
-    @classmethod
-    def _fromrep(cls, rep):
-        """
-        This the new constructor mechanism for matrices in sympy 1.9.
-        Standard new object go through `_new` but arithmetic operations directly use
-        the representation based one.
-        This class method is only accessible from an existing AbstractTensor
-        that contains a grid or dimensions.
-        """
-        newobj = super()._fromrep(rep)
-        grid, dimensions = newobj._infer_dims()
-        try:
-            # This is needed when `_fromrep` is called directly in 1.9
-            # for example with mul.
-            newobj.__init_finalize__(newobj.rows, newobj.cols, newobj.flat(),
-                                     grid=grid, dimensions=dimensions)
-        except TypeError:
-            # We can end up here when `_fromrep` is called through the default _new
-            # when input `comps` don't have grid or dimensions. For example
-            # `test_non_devito_tens` in `test_tensor.py`.
-            pass
-        return newobj
-
-    @classmethod
-    def __subfunc_setup__(cls, *args, **kwargs):
-        """Setup each component of the tensor as a Devito type."""
-        return []
-
-    @property
-    def grid(self):
-        """
-        A Tensor is expected to have all its components defined over the same grid
-        """
-        grids = {getattr(c, 'grid', None) for c in self.flat()} - {None}
-        if len(grids) == 0:
-            return None
-        assert len(grids) == 1
-        return grids.pop()
-
-    def _infer_dims(self):
-        grids = {getattr(c, 'grid', None) for c in self.flat()} - {None}
-        dimensions = {d for c in self.flat()
-                      for d in getattr(c, 'dimensions', ())} - {None}
-        # If none of the components are devito objects, returns a sympy Matrix
-        if len(grids) == 0 and len(dimensions) == 0:
-            return None, None
-        elif len(grids) > 0:
-            dimensions = None
-            assert len(grids) == 1
-            grid = grids.pop()
-        else:
-            grid = None
-            dimensions = tuple(dimensions)
-
-        return grid, dimensions
-
-    def flat(self):
-        try:
-            return super().flat()
-        except AttributeError:
-            return self._mat
-
-    def __init_finalize__(self, *args, **kwargs):
-        pass
-
-    __hash__ = sympy.ImmutableDenseMatrix.__hash__
-
-    def doit(self, **hint):
-        return self
-
-    def transpose(self, inner=True):
-        new = super().transpose()
-        if inner:
-            return new.applyfunc(lambda x: getattr(x, 'T', x))
-        return new
-
-    def adjoint(self, inner=True):
-        # Real valued adjoint is transpose
-        return self.transpose(inner=inner)
-
-    @call_highest_priority('__radd__')
-    def __add__(self, other):
-        try:
-            # Most case support sympy add
-            tsum = super().__add__(other)
-        except TypeError:
-            # Sympy doesn't support add with scalars
-            tsum = self.applyfunc(lambda x: x + other)
-
-        # As of sympy 1.13, super does not throw an exception but
-        # only returns NotImplemented for some internal dispatch.
-        if tsum is NotImplemented:
-            return self.applyfunc(lambda x: x + other)
-
-        return tsum
-
-    def _eval_matrix_mul(self, other):
-        """
-        Copy paste from sympy to avoid explicit call to sympy.Add
-        TODO: fix inside sympy
-        """
-        other_len = other.rows*other.cols
-        new_len = self.rows*other.cols
-        new_mat = [self.zero]*new_len
-
-        # If we multiply an n x 0 with a 0 x m, the
-        # expected behavior is to produce an n x m matrix of zeros
-        if self.cols != 0 and other.rows != 0:
-            self_cols = self.cols
-            mat = self.flat()
-            try:
-                other_mat = other.flat()
-            except AttributeError:
-                other_mat = other._mat
-            for i in range(new_len):
-                row, col = i // other.cols, i % other.cols
-                row_indices = range(self_cols*row, self_cols*(row+1))
-                col_indices = range(col, other_len, other.cols)
-                vec = [mat[a]*other_mat[b] for a, b in zip(row_indices, col_indices)]
-                new_mat[i] = sum(vec)
-
-        # Get new class and return product
-        newcls = self.classof_prod(other, other.cols)
-        return newcls._new(self.rows, other.cols, new_mat, copy=False)
-
-
 class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
 
     """
@@ -814,22 +665,22 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
 
     There are five relevant AbstractFunction sub-types: ::
 
-        * Array: A function that does not carry data.
+        * Array: A compiler-generated object that does not carry data.
         * Function: A space-varying discrete function, which carries user data.
         * TimeFunction: A time- and space-varying discrete function, which carries
                         user data.
         * SparseFunction: A space-varying discrete function representing "sparse"
                           points, i.e. points that are not aligned with the
                           computational grid.
-        * SparseTimeFunction: A time- and space-varying function representing "sparse"
-                          points, i.e. points that are not aligned with the
-                          computational grid.
-        * PrecomputedSparseFunction: A SparseFunction that uses a custom interpolation
-                                     scheme, instead of linear interpolators.
+        * SparseTimeFunction: A time- and space-varying function representing
+                              "sparse" points, i.e. points that are not aligned
+                              with the computational grid.
+        * PrecomputedSparseFunction: A SparseFunction that uses a custom
+                                     interpolation scheme, instead of linear
+                                     interpolators.
         * PrecomputedSparseTimeFunction: A SparseTimeFunction that uses a custom
                                          interpolation scheme, instead of linear
                                          interpolators.
-
     """
 
     # SymPy attributes, explicitly say these are not Matrices
@@ -839,16 +690,13 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
     is_AbstractFunction = True
 
     # SymPy default assumptions
-    is_real = True
-    is_imaginary = False
     is_commutative = True
 
     # Devito default assumptions
     is_regular = True
     """
-    True if data and iteration points are aligned. Cases where they won't be
-    aligned (currently unsupported): Functions defined on SubDomains; compressed
-    Functions; etc.
+    True if alignment between iteration and data points is affine. Examples of cases
+    where this would be False include types such as compressed Functions, etc.
     """
 
     is_autopaddable = False
@@ -890,12 +738,17 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
             return function
 
         # If dimensions have been replaced, then it is necessary to set `function`
-        # to None. It is also necessary to remove halo and padding kwargs so that
+        # to None. It may also be necessary to remove halo and padding so that
         # they are rebuilt with the new dimensions
         if function is not None and function.dimensions != dimensions:
             function = kwargs['function'] = None
-            kwargs.pop('padding', None)
-            kwargs.pop('halo', None)
+            for i in ('halo', 'padding'):
+                if len(kwargs[i]) != len(dimensions):
+                    kwargs.pop(i)
+                else:
+                    # Downcast from DimensionTuple so that the new `dimensions`
+                    # are used down the line
+                    kwargs[i] = tuple(kwargs[i])
 
         with sympy_mutex:
             # Go straight through Basic, thus bypassing caching and machinery
@@ -932,6 +785,8 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         return str(self)
 
     _latex = _sympystr
+    _eval_is_real = AbstractSymbol._eval_is_real
+    _eval_is_imaginary = AbstractSymbol._eval_is_imaginary
 
     def _pretty(self, printer, **kwargs):
         return printer._print_Function(self, func_name=self.name)
@@ -960,6 +815,9 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         return class_key, args, exp, coeff
 
     def __init_finalize__(self, *args, **kwargs):
+        # A `Distributor` to handle domain decomposition
+        self._distributor = self.__distributor_setup__(**kwargs)
+
         # Setup halo, padding, and ghost regions
         self._is_halo_dirty = False
         self._halo = self.__halo_setup__(**kwargs)
@@ -969,8 +827,7 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         # There may or may not be a `Grid`
         self._grid = kwargs.get('grid')
 
-        # A `Distributor` to handle domain decomposition
-        self._distributor = self.__distributor_setup__(**kwargs)
+        # Symbol properties
 
         # "Aliasing" another AbstractFunction means that `self` logically
         # represents another object. For example, `self` might be used as the
@@ -1097,7 +954,9 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         f(x) : origin = 0
         f(x + hx/2) : origin = hx/2
         """
-        return DimensionTuple(*(r - d for d, r in zip(self.dimensions, self.indices_ref)),
+        return DimensionTuple(*(r - d + o for d, r, o
+                                in zip(self.dimensions, self.indices_ref,
+                                       self._offset_subdomain)),
                               getters=self.dimensions)
 
     @property
@@ -1109,6 +968,11 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
     def space_dimensions(self):
         """Tuple of Dimensions defining the physical space."""
         return tuple(d for d in self.dimensions if d.is_Space)
+
+    @cached_property
+    def root_dimensions(self):
+        """Tuple of root Dimensions of the physical space Dimensions."""
+        return tuple(d.root for d in self.space_dimensions)
 
     @property
     def base(self):
@@ -1167,12 +1031,16 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         # Apply interpolation from inner most dim
         for d, i in self._grid_map.items():
             retval = retval.diff(d, deriv_order=0, fd_order=2, x0={d: i})
-        if self._avg_mode == 'harmonic':
-            retval = 1 / retval
 
         # Evaluate. Since we used `self.function` it will be on the grid when evaluate
         # is called again within FD
-        return retval.evaluate.expand()
+        if self._avg_mode == 'harmonic':
+            from devito.finite_differences.differentiable import SafeInv
+            retval = SafeInv(retval.evaluate, self.function)
+        else:
+            retval = retval.evaluate
+
+        return retval
 
     @property
     def shape(self):
@@ -1183,6 +1051,11 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
     def grid(self):
         """The Grid on which the discretization occurred."""
         return self._grid
+
+    @property
+    def _is_on_subdomain(self):
+        """True if defined on a SubDomain"""
+        return self.grid and self.grid.is_SubDomain
 
     @property
     def dtype(self):
@@ -1430,6 +1303,30 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
 
         return DimensionTuple(*offsets, getters=self.dimensions, left=left, right=right)
 
+    @cached_property
+    def _offset_subdomain(self):
+        """Offset of subdomain indices versus the global index."""
+        # If defined on a SubDomain, then need to offset indices accordingly
+        if not self._is_on_subdomain:
+            return DimensionTuple(*[0 for _ in self.dimensions], getters=self.dimensions)
+        # Symbolic offsets to avoid potential issues with user overrides
+        offsets = []
+        for d in self.dimensions:
+            if d.is_Sub:
+                l_tkn, r_tkn = d.tkns
+                if l_tkn.value is None:
+                    # Right subdimension
+                    offsets.append(-r_tkn + d.symbolic_max + 1)
+                elif r_tkn.value is None:
+                    # Left subdimension
+                    offsets.append(0)
+                else:
+                    # Middle subdimension
+                    offsets.append(l_tkn)
+            else:
+                offsets.append(0)
+        return DimensionTuple(*offsets, getters=self.dimensions)
+
     @property
     def _data_alignment(self):
         """
@@ -1450,12 +1347,19 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         # Indices after substitutions
         indices = []
         for a, d, o, s in zip(self.args, self.dimensions, self.origin, subs):
-            if d in a.free_symbols:
+            if a.is_Function and len(a.args) == 1:
+                # E.g. Abs(expr)
+                arg = a.args[0]
+                func = a.func
+            else:
+                arg = a
+                func = lambda x: x
+            if d in arg.free_symbols:
                 # Shift by origin d -> d - o.
-                indices.append(sympy.sympify(a.subs(d, d - o).xreplace(s)))
+                indices.append(func(sympy.sympify(arg.subs(d, d - o).xreplace(s))))
             else:
                 # Dimension has been removed, e.g. u[10], plain shift by origin
-                indices.append(sympy.sympify(a - o).xreplace(s))
+                indices.append(func(sympy.sympify(arg - o).xreplace(s)))
 
         indices = [i.xreplace({k: sympy.Integer(k) for k in i.atoms(sympy.Float)})
                    for i in indices]
@@ -1486,6 +1390,236 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         return args, kwargs
 
 
+class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
+
+    """
+    Base class for vector and tensor valued functions. It inherits from and
+    mimicks the behavior of a sympy.ImmutableDenseMatrix.
+
+
+    The sub-hierachy is as follows
+
+                         AbstractTensor
+                                |
+                          TensorFunction
+                                |
+                 ---------------------------------
+                 |                               |
+          VectorFunction                 TensorTimeFunction
+                        \\-------\\              |
+                                 \\------- VectorTimeFunction
+
+    There are four relevant AbstractTensor sub-types: ::
+
+        * TensorFunction: A space-varying tensor valued function.
+        * VectorFunction: A space-varying vector valued function.
+        * TensorTimeFunction: A time-space-varying tensor valued function.
+        * VectorTimeFunction: A time-space-varying vector valued function.
+    """
+
+    # SymPy attributes
+    is_MatrixLike = True
+    is_Matrix = True
+
+    # Devito attributes
+    is_AbstractTensor = True
+    is_TensorValued = True
+    is_VectorValued = False
+
+    __rkwargs__ = AbstractFunction.__rkwargs__
+
+    @classmethod
+    def _new(cls, *args, **kwargs):
+        if args:
+            try:
+                # Constructor if input is (rows, cols, lambda)
+                newobj = super()._new(*args)
+            except ValueError:
+                # Constructor if input is list of list as (row, cols, list_of_list)
+                # doesn't work as it expects a flattened.
+                newobj = super()._new(args[2])
+
+            # Filter grid and dimensions
+            grid, dimensions = newobj._infer_dims()
+            if grid is None and dimensions is None:
+                return sympy.ImmutableDenseMatrix(*args)
+            # Initialized with constructed object
+            newobj.__init_finalize__(newobj.rows, newobj.cols, newobj.flat(),
+                                     grid=grid, dimensions=dimensions)
+        else:
+            # Initialize components and create new Matrix from standard
+            # Devito inputs
+            comps = cls.__subfunc_setup__(*args, **kwargs)
+            newobj = super()._new(comps)
+            newobj.__init_finalize__(*args, **kwargs)
+
+        return newobj
+
+    @classmethod
+    def _fromrep(cls, rep):
+        """
+        This the new constructor mechanism for matrices in sympy 1.9.
+        Standard new object go through `_new` but arithmetic operations directly use
+        the representation based one.
+        This class method is only accessible from an existing AbstractTensor
+        that contains a grid or dimensions.
+        """
+        newobj = super()._fromrep(rep)
+        grid, dimensions = newobj._infer_dims()
+        try:
+            # This is needed when `_fromrep` is called directly in 1.9
+            # for example with mul.
+            newobj.__init_finalize__(newobj.rows, newobj.cols, newobj.flat(),
+                                     grid=grid, dimensions=dimensions)
+        except TypeError:
+            # We can end up here when `_fromrep` is called through the default _new
+            # when input `comps` don't have grid or dimensions. For example
+            # `test_non_devito_tens` in `test_tensor.py`.
+            pass
+        return newobj
+
+    @classmethod
+    def __subfunc_setup__(cls, *args, **kwargs):
+        """Setup each component of the tensor as a Devito type."""
+        return []
+
+    @classmethod
+    def _sympify(self, arg):
+        # This is used internally by sympy to process arguments at rebuilt. And since
+        # some of our properties are non-sympyfiable we need to have a fallback
+        try:
+            return super()._sympify(arg)
+        except sympy.SympifyError:
+            return arg
+
+    @property
+    def grid(self):
+        """
+        A Tensor is expected to have all its components defined over the same grid
+        """
+        grids = {getattr(c, 'grid', None) for c in self.flat()} - {None}
+        if len(grids) == 0:
+            return None
+        assert len(grids) == 1
+        return grids.pop()
+
+    @property
+    def name(self):
+        for c in self.values():
+            try:
+                return c.name.split('_')[0]
+            except AttributeError:
+                # `c` is not a devito object
+                pass
+        # If we end up here, then we have no devito objects
+        # in the matrix, so we ust return the class name
+        return self.__class__.__name__
+
+    def _rebuild(self, *args, **kwargs):
+        # Plain `func` call (row, col, comps)
+        if not kwargs.keys() & self.__rkwargs__:
+            if len(args) != 3:
+                raise ValueError("Invalid number of arguments, expected nrow, ncol, "
+                                 "list of components")
+            return self._new(*args, **kwargs)
+        # We need to rebuild the components with the new name then
+        # rebuild the matrix
+        newname = kwargs.pop('name', self.name)
+        comps = [f.func(*args, name=f.name.replace(self.name, newname), **kwargs)
+                 for f in self.flat()]
+        # Rebuild the matrix with the new components
+        return self._new(comps)
+
+    func = _rebuild
+
+    def _infer_dims(self):
+        grids = {getattr(c, 'grid', None) for c in self.flat()} - {None}
+        grids = {g.root for g in grids}
+        dimensions = {d for c in self.flat()
+                      for d in getattr(c, 'dimensions', ())} - {None}
+        # If none of the components are devito objects, returns a sympy Matrix
+        if len(grids) == 0 and len(dimensions) == 0:
+            return None, None
+        elif len(grids) > 0:
+            dimensions = None
+            assert len(grids) == 1
+            grid = grids.pop()
+        else:
+            grid = None
+            dimensions = tuple(dimensions)
+
+        return grid, dimensions
+
+    def flat(self):
+        try:
+            return super().flat()
+        except AttributeError:
+            return self._mat
+
+    def __init_finalize__(self, *args, **kwargs):
+        self._name = kwargs.get('name', None)
+
+    __hash__ = sympy.ImmutableDenseMatrix.__hash__
+
+    def doit(self, **hint):
+        return self
+
+    def transpose(self, inner=True):
+        new = super().transpose()
+        if inner:
+            return new.applyfunc(lambda x: getattr(x, 'T', x))
+        return new
+
+    def adjoint(self, inner=True):
+        # Real valued adjoint is transpose
+        return self.transpose(inner=inner)
+
+    @call_highest_priority('__radd__')
+    def __add__(self, other):
+        try:
+            # Most case support sympy add
+            tsum = super().__add__(other)
+        except TypeError:
+            # Sympy doesn't support add with scalars
+            tsum = self.applyfunc(lambda x: x + other)
+
+        # As of sympy 1.13, super does not throw an exception but
+        # only returns NotImplemented for some internal dispatch.
+        if tsum is NotImplemented:
+            return self.applyfunc(lambda x: x + other)
+
+        return tsum
+
+    def _eval_matrix_mul(self, other):
+        """
+        Copy paste from sympy to avoid explicit call to sympy.Add
+        TODO: fix inside sympy
+        """
+        other_len = other.rows*other.cols
+        new_len = self.rows*other.cols
+        new_mat = [self.zero]*new_len
+
+        # If we multiply an n x 0 with a 0 x m, the
+        # expected behavior is to produce an n x m matrix of zeros
+        if self.cols != 0 and other.rows != 0:
+            self_cols = self.cols
+            mat = self.flat()
+            try:
+                other_mat = other.flat()
+            except AttributeError:
+                other_mat = other._mat
+            for i in range(new_len):
+                row, col = i // other.cols, i % other.cols
+                row_indices = range(self_cols*row, self_cols*(row+1))
+                col_indices = range(col, other_len, other.cols)
+                vec = [mat[a]*other_mat[b] for a, b in zip(row_indices, col_indices)]
+                new_mat[i] = sum(vec)
+
+        # Get new class and return product
+        newcls = self.classof_prod(other, other.cols)
+        return newcls._new(self.rows, other.cols, new_mat, copy=False)
+
+
 # Extended SymPy hierarchy follows, for essentially two reasons:
 # - To keep track of `function`
 # - To override SymPy caching behaviour
@@ -1510,6 +1644,12 @@ class IndexedBase(sympy.IndexedBase, Basic, Pickable):
         return obj
 
     func = Pickable._rebuild
+
+    @sympy.cacheit
+    def sort_key(self, order=None):
+        class_key, args, exp, coeff = super().sort_key(order=order)
+        args = (self.function.class_key(), *args)
+        return class_key, args, exp, coeff
 
     def __getitem__(self, indices, **kwargs):
         """Produce a types.Indexed, rather than a sympy.Indexed."""

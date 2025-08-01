@@ -3,6 +3,7 @@ Synchronization operations inside the IR.
 """
 
 from collections import defaultdict
+from functools import cached_property
 
 from devito.data import FULL
 from devito.tools import Pickable, as_tuple, filter_ordered, frozendict
@@ -163,8 +164,23 @@ class Ops(frozendict):
             m[d] = set(self.get(d, [])) | set(v)
         return Ops(m)
 
+    def _get_sync(self, cls, dims=None):
+        if dims is None:
+            dims = list(self)
+        for d in dims:
+            for s in self.get(d, []):
+                if isinstance(s, cls):
+                    # NOTE: Remember there can only be one SyncOp of a given
+                    # type per `Ops` object
+                    return s
+        return None
 
-def normalize_syncs(*args):
+    @cached_property
+    def initarray(self):
+        return self._get_sync(InitArray)
+
+
+def normalize_syncs(*args, strict=True):
     if not args:
         return {}
 
@@ -175,12 +191,13 @@ def normalize_syncs(*args):
 
     syncs = {k: tuple(filter_ordered(v)) for k, v in syncs.items()}
 
-    for v in syncs.values():
-        waitlocks = [s for s in v if isinstance(s, WaitLock)]
-        withlocks = [s for s in v if isinstance(s, WithLock)]
+    if strict:
+        for v in syncs.values():
+            waitlocks = [s for s in v if isinstance(s, WaitLock)]
+            withlocks = [s for s in v if isinstance(s, WithLock)]
 
-        if waitlocks and withlocks:
-            # We do not allow mixing up WaitLock and WithLock ops
-            raise ValueError("Incompatible SyncOps")
+            if waitlocks and withlocks:
+                # We do not allow mixing up WaitLock and WithLock ops
+                raise ValueError("Incompatible SyncOps")
 
     return Ops(syncs)

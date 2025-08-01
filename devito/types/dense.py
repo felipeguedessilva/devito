@@ -5,7 +5,6 @@ from operator import mul
 
 import numpy as np
 import sympy
-from psutil import virtual_memory
 from functools import cached_property
 
 from devito.builtins import assign
@@ -21,12 +20,13 @@ from devito.symbolics import FieldFromPointer, normalize_args
 from devito.finite_differences import Differentiable, generate_fd_shortcuts
 from devito.finite_differences.tools import fd_weights_registry
 from devito.tools import (ReducerMap, as_tuple, c_restrict_void_p, flatten,
-                          is_integer, memoized_meth, dtype_to_ctype, humanbytes)
+                          is_integer, memoized_meth, dtype_to_ctype, humanbytes,
+                          mpi4py_mapper)
 from devito.types.dimension import Dimension
 from devito.types.args import ArgProvider
 from devito.types.caching import CacheManager
 from devito.types.basic import AbstractFunction, Size
-from devito.types.utils import Buffer, DimensionTuple, NODE, CELL, host_layer
+from devito.types.utils import Buffer, DimensionTuple, NODE, CELL, host_layer, Staggering
 
 __all__ = ['Function', 'TimeFunction', 'SubFunction', 'TempFunction']
 
@@ -66,9 +66,6 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
     __rkwargs__ = AbstractFunction.__rkwargs__ + ('staggered', 'coefficients')
 
     def __init_finalize__(self, *args, function=None, **kwargs):
-        # Staggering metadata
-        self._staggered = self.__staggered_setup__(**kwargs)
-
         # Now that *all* __X_setup__ hooks have been called, we can let the
         # superclass constructor do its job
         super().__init_finalize__(*args, **kwargs)
@@ -180,18 +177,6 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
                                  " not %s" % (str(fd_weights_registry), coeffs))
         return coeffs
 
-    def __staggered_setup__(self, **kwargs):
-        """
-        Setup staggering-related metadata. This method assigns:
-
-            * 0 to non-staggered dimensions;
-            * 1 to staggered dimensions.
-        """
-        staggered = kwargs.get('staggered', None)
-        if staggered is CELL:
-            staggered = self.dimensions
-        return staggered
-
     @cached_property
     def _functions(self):
         return {self.function}
@@ -205,8 +190,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         return True
 
     @property
-    def staggered(self):
-        return self._staggered
+    def _mem_heap(self):
+        return True
 
     @property
     def coefficients(self):
@@ -305,7 +290,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             return self.shape
         retval = []
         for d, s in zip(self.dimensions, self.shape):
-            size = self.grid.dimension_map.get(d)
+            size = self.grid.size_map.get(d)
             retval.append(size.glb if size is not None else s)
         return tuple(retval)
 
@@ -346,7 +331,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
         sizes = tuple(Size(i, j) for i, j in zip(left, right))
 
-        if self._distributor.is_parallel and (any(left) > 0 or any(right)) > 0:
+        if self._distributor.is_parallel and (any(left) or any(right)):
             try:
                 warning_msg = """A space order of {0} and a halo size of {1} has been
                                  set but the current rank ({2}) has a domain size of
@@ -667,6 +652,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
     _C_structname = 'dataobj'
     _C_field_data = 'data'
     _C_field_size = 'size'
+    _C_field_nbytes = 'nbytes'
     _C_field_nopad_size = 'npsize'
     _C_field_domain_size = 'dsize'
     _C_field_halo_size = 'hsize'
@@ -676,7 +662,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
     _C_ctype = POINTER(type(_C_structname, (Structure,),
                             {'_fields_': [(_C_field_data, c_restrict_void_p),
-                                          (_C_field_size, POINTER(c_ulong)),
+                                          (_C_field_size, POINTER(c_int)),
+                                          (_C_field_nbytes, c_ulong),
                                           (_C_field_nopad_size, POINTER(c_ulong)),
                                           (_C_field_domain_size, POINTER(c_ulong)),
                                           (_C_field_halo_size, POINTER(c_int)),
@@ -694,7 +681,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
         dataobj = byref(self._C_ctype._type_())
         dataobj._obj.data = data.ctypes.data_as(c_restrict_void_p)
-        dataobj._obj.size = (c_ulong*self.ndim)(*data.shape)
+        dataobj._obj.size = (c_int*self.ndim)(*data.shape)
+        dataobj._obj.nbytes = data.nbytes
 
         # MPI-related fields
         dataobj._obj.npsize = (c_ulong*self.ndim)(*[i - sum(j) for i, j in
@@ -782,6 +770,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
         neighborhood = self._distributor.neighborhood
         comm = self._distributor.comm
+        comm_dtype = mpi4py_mapper.get(self.dtype, self.dtype)
 
         for d in self._dist_dimensions:
             for i in [LEFT, RIGHT]:
@@ -791,18 +780,18 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
 
                 # Gather send data
                 data = self._data_in_region(OWNED, d, i)
-                sendbuf = np.ascontiguousarray(data)
+                sendbuf = np.ascontiguousarray(data.view(comm_dtype))
 
                 # Setup recv buffer
                 shape = self._data_in_region(HALO, d, i.flip()).shape
-                recvbuf = np.ndarray(shape=shape, dtype=self.dtype)
+                recvbuf = np.ndarray(shape=shape, dtype=comm_dtype)
 
                 # Communication
                 comm.Sendrecv(sendbuf, dest=dest, recvbuf=recvbuf, source=source)
 
                 # Scatter received data
                 if recvbuf is not None and source != MPI.PROC_NULL:
-                    self._data_in_region(HALO, d, i.flip())[:] = recvbuf
+                    self._data_in_region(HALO, d, i.flip())[:] = recvbuf.view(self.dtype)
 
         self._is_halo_dirty = False
 
@@ -1024,9 +1013,13 @@ class Function(DiscreteFunction):
     def __init_finalize__(self, *args, **kwargs):
         super().__init_finalize__(*args, **kwargs)
 
+        # Staggering
+        self._staggered = self.__staggered_setup__(self.dimensions,
+                                                   staggered=kwargs.get('staggered'))
+
         # Space order
         space_order = kwargs.get('space_order', 1)
-        if isinstance(space_order, int):
+        if is_integer(space_order):
             self._space_order = space_order
         elif isinstance(space_order, tuple) and len(space_order) >= 2:
             self._space_order = space_order[0]
@@ -1056,7 +1049,7 @@ class Function(DiscreteFunction):
 
     @cached_property
     def _fd_priority(self):
-        return 1 if self.staggered in [NODE, None] else 2
+        return 1 if self.staggered.on_node else 2
 
     @property
     def is_parameter(self):
@@ -1073,35 +1066,66 @@ class Function(DiscreteFunction):
         return self
 
     @classmethod
+    def __staggered_setup__(cls, dimensions, staggered=None, **kwargs):
+        """
+        Setup staggering-related metadata. This method assigns:
+
+            * 0 to non-staggered dimensions;
+            * 1 to staggered dimensions.
+        """
+        if not staggered:
+            processed = ()
+        elif staggered is CELL:
+            processed = (sympy.S.One,)*len(dimensions)
+        elif staggered is NODE:
+            processed = (sympy.S.Zero,)*len(dimensions)
+        elif all(is_integer(s) for s in as_tuple(staggered)):
+            # Staggering is already a tuple likely from rebuild
+            assert len(staggered) == len(dimensions)
+            processed = staggered
+        else:
+            processed = []
+            for d in dimensions:
+                if d in as_tuple(staggered):
+                    processed.append(sympy.S.One)
+                elif -d in as_tuple(staggered):
+                    processed.append(sympy.S.NegativeOne)
+                else:
+                    processed.append(sympy.S.Zero)
+        return Staggering(*processed, getters=dimensions)
+
+    @classmethod
     def __indices_setup__(cls, *args, **kwargs):
         grid = kwargs.get('grid')
         dimensions = kwargs.get('dimensions')
+        staggered = kwargs.get('staggered')
+
         if grid is None:
             if dimensions is None:
                 raise TypeError("Need either `grid` or `dimensions`")
         elif dimensions is None:
             dimensions = grid.dimensions
 
+        staggered = cls.__staggered_setup__(dimensions, staggered=staggered)
         if args:
             assert len(args) == len(dimensions)
-            return tuple(dimensions), tuple(args)
-
-        # Staggered indices
-        staggered = kwargs.get("staggered", None)
-        if staggered in [CELL, NODE]:
-            staggered_indices = dimensions
+            staggered_indices = tuple(args)
         else:
-            mapper = {d: d for d in dimensions}
-            for s in as_tuple(staggered):
-                c, s = s.as_coeff_Mul()
-                mapper.update({s: s + c * s.spacing / 2})
-            staggered_indices = mapper.values()
-
+            if not staggered:
+                staggered_indices = dimensions
+            else:
+                staggered_indices = (d + i * d.spacing / 2
+                                     for d, i in zip(dimensions, staggered))
         return tuple(dimensions), tuple(staggered_indices)
 
     @property
+    def staggered(self):
+        """The staggered indices of the object."""
+        return self._staggered
+
+    @property
     def is_Staggered(self):
-        return self.staggered is not None
+        return bool(self.staggered)
 
     @classmethod
     def __shape_setup__(cls, **kwargs):
@@ -1128,7 +1152,7 @@ class Function(DiscreteFunction):
             loc_shape = []
             for d, s in zip(dimensions, shape):
                 if d in grid.dimensions:
-                    size = grid.dimension_map[d]
+                    size = grid.size_map[d]
                     if size.glb != s and s is not None:
                         raise ValueError("Dimension `%s` is given size `%d`, "
                                          "while `grid` says `%s` has size `%d` "
@@ -1141,13 +1165,17 @@ class Function(DiscreteFunction):
         return shape
 
     def __halo_setup__(self, **kwargs):
+        if self._distributor and self._distributor.loc_empty:
+            # No need to assign a halo on a completely empty rank
+            return DimensionTuple(*[(0, 0) for i in self.dimensions],
+                                  getters=self.dimensions)
         halo = kwargs.get('halo')
         if halo is not None:
             if isinstance(halo, DimensionTuple):
                 halo = tuple(halo[d] for d in self.dimensions)
         else:
             space_order = kwargs.get('space_order', 1)
-            if isinstance(space_order, int):
+            if is_integer(space_order):
                 v = (space_order, space_order)
                 halo = [v if i.is_Space else (0, 0) for i in self.dimensions]
 
@@ -1180,12 +1208,12 @@ class Function(DiscreteFunction):
         elif isinstance(padding, DimensionTuple):
             padding = tuple(padding[d] for d in self.dimensions)
 
-        elif isinstance(padding, int):
+        elif is_integer(padding):
             padding = tuple((0, padding) if d.is_Space else (0, 0)
                             for d in self.dimensions)
 
         elif isinstance(padding, tuple) and len(padding) == self.ndim:
-            padding = tuple((0, i) if isinstance(i, int) else i for i in padding)
+            padding = tuple((0, i) if is_integer(i) else i for i in padding)
 
         else:
             raise TypeError("`padding` must be int or %d-tuple of ints" % self.ndim)
@@ -1370,15 +1398,7 @@ class TimeFunction(Function):
         self._time_order = kwargs.get('time_order', 1)
         super().__init_finalize__(*args, **kwargs)
 
-        # Check we won't allocate too much memory for the system
-        available_mem = virtual_memory().available
-        required_mem = np.dtype(self.dtype).itemsize * self.size
-        if required_mem > available_mem:
-            raise MemoryError(
-                f"Trying to allocate more memory ({humanbytes(required_mem)}) "
-                f"for `{self.name}` than available ({humanbytes(available_mem)})"
-            )
-        if not isinstance(self.time_order, int):
+        if not is_integer(self.time_order):
             raise TypeError("`time_order` must be int")
 
         self.save = kwargs.get('save')
@@ -1393,7 +1413,6 @@ class TimeFunction(Function):
     @classmethod
     def __indices_setup__(cls, *args, **kwargs):
         dimensions = kwargs.get('dimensions')
-        staggered = kwargs.get('staggered')
 
         if dimensions is None:
             save = kwargs.get('save')
@@ -1401,14 +1420,14 @@ class TimeFunction(Function):
             time_dim = kwargs.get('time_dim')
 
             if time_dim is None:
-                time_dim = grid.time_dim if isinstance(save, int) else grid.stepping_dim
+                time_dim = grid.time_dim if is_integer(save) else grid.stepping_dim
             elif not (isinstance(time_dim, Dimension) and time_dim.is_Time):
                 raise TypeError("`time_dim` must be a time dimension")
             dimensions = list(Function.__indices_setup__(**kwargs)[0])
             dimensions.insert(cls._time_position, time_dim)
 
         return Function.__indices_setup__(
-            *args, dimensions=dimensions, staggered=staggered
+            *args, dimensions=dimensions, staggered=kwargs.get('staggered')
         )
 
     @classmethod
@@ -1431,7 +1450,7 @@ class TimeFunction(Function):
                 shape.insert(cls._time_position, time_order + 1)
             elif isinstance(save, Buffer):
                 shape.insert(cls._time_position, save.val)
-            elif isinstance(save, int):
+            elif is_integer(save):
                 shape.insert(cls._time_position, save)
             else:
                 raise TypeError("`save` can be None, int or Buffer, not %s" % type(save))
@@ -1447,7 +1466,7 @@ class TimeFunction(Function):
 
     @cached_property
     def _fd_priority(self):
-        return 2.1 if self.staggered in [NODE, None] else 2.2
+        return 2.1 if self.staggered.on_node else 2.2
 
     @property
     def time_order(self):

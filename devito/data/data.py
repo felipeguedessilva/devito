@@ -154,7 +154,7 @@ class Data(np.ndarray):
 
     def _global(self, glb_idx, decomposition):
         """A "global" view of ``self`` over a given Decomposition."""
-        if self._is_distributed:
+        if self._is_decomposed:
             raise ValueError("Cannot derive a decomposed view from a decomposed Data")
         if len(decomposition) != self.ndim:
             raise ValueError("`decomposition` should have ndim=%d entries" % self.ndim)
@@ -176,13 +176,12 @@ class Data(np.ndarray):
         @wraps(func)
         def wrapper(data, *args, **kwargs):
             glb_idx = args[0]
-            is_gather = isinstance(kwargs.get('gather_rank', None), int)
+            is_gather = isinstance(kwargs.get('gather_rank'), int)
             if is_gather and all(i == slice(None, None, 1) for i in glb_idx):
                 comm_type = gather
-            elif len(args) > 1 and isinstance(args[1], Data) \
-                    and args[1]._is_mpi_distributed:
+            elif len(args) > 1 and isinstance(args[1], Data) and args[1]._is_decomposed:
                 comm_type = index_by_index
-            elif data._is_mpi_distributed:
+            elif data._is_decomposed:
                 for i in as_tuple(glb_idx):
                     if isinstance(i, slice) and i.step is not None and i.step < 0:
                         comm_type = index_by_index
@@ -196,8 +195,9 @@ class Data(np.ndarray):
         return wrapper
 
     @property
-    def _is_mpi_distributed(self):
-        return self._is_distributed and configuration['mpi']
+    def _is_decomposed(self):
+        return self._is_distributed and configuration['mpi'] and \
+            self._distributor.comm.size > 1
 
     def __repr__(self):
         return super(Data, self._local).__repr__()
@@ -238,11 +238,12 @@ class Data(np.ndarray):
                     stop += sendcounts[i]
                     data_slice = recvbuf[slice(start, stop, step)]
                     shape = [r.stop-r.start for r in self._distributor.all_ranges[i]]
-                    idx = [slice(r.start, r.stop, r.step)
-                           for r in self._distributor.all_ranges[i]]
-                    for i in range(len(self.shape) - len(self._distributor.glb_shape)):
-                        shape.insert(i, glb_shape[i])
-                        idx.insert(i, slice(0, glb_shape[i]+1, 1))
+                    idx = [slice(r.start - d.glb_min, r.stop - d.glb_min, r.step)
+                           for r, d in zip(self._distributor.all_ranges[i],
+                                           self._distributor.decomposition)]
+                    for j in range(len(self.shape) - len(self._distributor.glb_shape)):
+                        shape.insert(j, glb_shape[j])
+                        idx.insert(j, slice(0, glb_shape[j]+1, 1))
                     retval[tuple(idx)] = data_slice.reshape(tuple(shape))
                 return retval
             else:
@@ -329,6 +330,7 @@ class Data(np.ndarray):
     @_check_idx
     def __setitem__(self, glb_idx, val, comm_type):
         loc_idx = self._index_glb_to_loc(glb_idx)
+
         if loc_idx is NONLOCAL:
             # no-op
             return
@@ -339,7 +341,7 @@ class Data(np.ndarray):
                 super().__setitem__(loc_idx, val)
             else:
                 super().__setitem__(glb_idx, val)
-        elif isinstance(val, Data) and val._is_distributed:
+        elif isinstance(val, Data) and val._is_decomposed:
             if comm_type is index_by_index:
                 glb_idx, val = self._process_args(glb_idx, val)
                 val_idx = as_tuple([slice(i.glb_min, i.glb_max+1, 1) for
@@ -359,14 +361,14 @@ class Data(np.ndarray):
                         or data_global[j].size == 0
                     if not skip:
                         self.__setitem__(idx_global[j], data_global[j])
-            elif self._is_distributed:
+            elif self._is_decomposed:
                 # `val` is decomposed, `self` is decomposed -> local set
                 super().__setitem__(glb_idx, val)
             else:
                 # `val` is decomposed, `self` is replicated -> gatherall-like
                 raise NotImplementedError
         elif isinstance(val, np.ndarray):
-            if self._is_distributed:
+            if self._is_decomposed:
                 # `val` is replicated, `self` is decomposed -> `val` gets decomposed
                 glb_idx = self._normalize_index(glb_idx)
                 glb_idx, val = self._process_args(glb_idx, val)
@@ -399,7 +401,7 @@ class Data(np.ndarray):
                 pass
             super().__setitem__(glb_idx, val)
         elif isinstance(val, Iterable):
-            if self._is_mpi_distributed:
+            if self._is_decomposed:
                 raise NotImplementedError("With MPI, data can only be set "
                                           "via scalars, numpy arrays or "
                                           "other data ")
@@ -476,7 +478,7 @@ class Data(np.ndarray):
         if len(glb_idx) > self.ndim:
             # Maybe user code is trying to add a new axis (see np.newaxis),
             # so the resulting array will be higher dimensional than `self`
-            if self._is_mpi_distributed:
+            if self._is_decomposed:
                 raise ValueError("Cannot increase dimensionality of MPI-distributed Data")
             else:
                 # As by specification, we are forced to ignore modulo indexing
@@ -492,7 +494,7 @@ class Data(np.ndarray):
                 try:
                     v = convert_index(i, dec, mode='glb_to_loc')
                 except TypeError:
-                    if self._is_mpi_distributed:
+                    if self._is_decomposed:
                         raise NotImplementedError("Unsupported advanced indexing with "
                                                   "MPI-distributed Data")
                     v = i

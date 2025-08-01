@@ -81,7 +81,7 @@ class TestSC:
 
         assert np.all(np.isclose(f0.data[:] - f1.data[:], 0.0, atol=1e-5, rtol=0))
 
-    def test_function_coefficients_xderiv(self):
+    def test_function_coefficients_xderiv_legacy(self):
         p = Dimension('p')
 
         nstc = 8
@@ -104,6 +104,35 @@ class TestSC:
 
         op = Operator(eqn)
         op()
+
+    @pytest.mark.parametrize('order', [2, 4, 6, 8])
+    def test_function_coefficients_xderiv(self, order):
+        p = Dimension('p')
+
+        grid = Grid(shape=(51, 51, 51))
+        x, y, z = grid.dimensions
+
+        f = Function(name='f', grid=grid, space_order=order)
+        w = Function(name='w', space_order=0, shape=(*grid.shape, order + 1),
+                     dimensions=(x, y, z, p))
+
+        expr0 = f.dx(w=w).dy(w=w).evaluate
+        expr1 = f.dxdy(w=w).evaluate
+        assert sp.simplify(expr0 - expr1) == 0
+
+    def test_coefficients_expr(self):
+        p = Dimension('p')
+
+        grid = Grid(shape=(51, 51, 51))
+        x, y, z = grid.dimensions
+
+        f = Function(name='f', grid=grid, space_order=4)
+        w = Function(name='w', space_order=0, shape=(*grid.shape, 5),
+                     dimensions=(x, y, z, p))
+
+        expr0 = f.dx(w=w/x.spacing).evaluate
+        expr1 = f.dx(w=w).evaluate / x.spacing
+        assert sp.simplify(expr0 - expr1) == 0
 
     def test_coefficients_w_xreplace(self):
         """Test custom coefficients with an xreplace before they are applied"""
@@ -202,8 +231,8 @@ class TestSC:
 
         eq_f = Eq(f, f.dx2(weights=weights))
 
-        expected = 'Eq(f(x + h_x/2), (1.0*f(x - h_x/2) - 2.0*f(x + h_x/2)'\
-            ' + 1.0*f(x + 3*h_x/2))/h_x**2)'
+        expected = 'Eq(f(x + h_x/2), f(x - h_x/2)/h_x**2 - 2.0*f(x + h_x/2)/h_x**2 '\
+            '+ f(x + 3*h_x/2)/h_x**2)'
         assert(str(eq_f.evaluate) == expected)
 
     @pytest.mark.parametrize('stagger', [True, False])
@@ -344,3 +373,59 @@ class TestSC:
         df_s = f.dx(weights=coeffs1)
 
         assert sp.simplify(df_s.evaluate - df.evaluate) == 0
+
+    def test_backward_compat_mixed(self):
+
+        grid = Grid(shape=(11,))
+        x, = grid.dimensions
+
+        f = Function(name='f', grid=grid, space_order=8)
+        g = Function(name='g', grid=grid, space_order=2)
+
+        coeffs0 = np.arange(0, 9)
+
+        coeffs = Coefficient(1, f, x, coeffs0)
+
+        eq = Eq(f, f.dx * g.dxc, coefficients=Substitutions(coeffs))
+
+        derivs = retrieve_derivatives(eq.rhs)
+
+        assert len(derivs) == 2
+        df = [d for d in derivs if d.expr == f][0]
+        dg = [d for d in derivs if d.expr == g][0]
+
+        assert np.all(df.weights == coeffs0)
+        assert dg.weights is None
+
+        eqe = eq.evaluate
+        assert '7.0*f(x + 3*h_x)' in str(eqe.rhs)
+        assert '0.5*g(x + h_x)' in str(eqe.rhs)
+        assert 'g(x + 2*h_x)' not in str(eqe.rhs)
+
+    def test_backward_compat_array_of_func(self):
+        grid = Grid(shape=(11, 11, 11))
+        x, _, _ = grid.dimensions
+        hx = x.spacing
+
+        f = Function(name='f', grid=grid, space_order=16, coefficients='symbolic')
+
+        # Define stencil coefficients.
+        weights = Function(name="w", space_order=0, shape=(9,), dimensions=(x,))
+        wdx = [weights[0]]
+        for iq in range(1, weights.shape[0]):
+            wdx.append(weights[iq])
+            wdx.insert(0, weights[iq])
+
+        # Plain numbers for comparison
+        wdxn = np.random.rand(17)
+
+        # Number with spacing
+        wdxns = wdxn / hx
+
+        dexev = f.dx(weights=wdx).evaluate
+        dexevn = f.dx(weights=wdxn).evaluate
+        dexevns = f.dx(weights=wdxns).evaluate
+
+        assert all(a.as_coefficient(1/hx) for a in dexevn.args)
+        assert all(a.as_coefficient(1/hx) for a in dexevns.args)
+        assert all(not a.as_coefficient(1/hx) for a in dexev.args)

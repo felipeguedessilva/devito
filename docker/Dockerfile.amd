@@ -3,63 +3,32 @@
 # Based on  https://github.com/amd/InfinityHub-CI/tree/main/base-gpu-mpi-rocm-docker
 ##############################################################
 
-ARG ROCM_VERSION=5.5.1
+ARG ROCM_VERSION=6.3.2
 
-FROM rocm/dev-ubuntu-22.04:${ROCM_VERSION}-complete as sdk-base
+FROM rocm/dev-ubuntu-22.04:${ROCM_VERSION}-complete AS sdk-base
 
-ARG UCX_BRANCH="v1.13.1"
-ARG OMPI_BRANCH="v4.1.4"
+ARG UCX_BRANCH="v1.16.0"
+ARG OMPI_BRANCH="v5.0.x"
 
 # Update and Install basic Linux development tools
 RUN rm /etc/apt/sources.list.d/* \
   && apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates \
-    git \
-    ssh \
-    make \
-    vim \
-    nano \
-    libtinfo* \
-    initramfs-tools \
-    libelf-dev \
-    numactl \
-    wget \
-    tmux \
-    build-essential \
-    autoconf \
-    automake \
-    libtool \
-    pkg-config \
-    libnuma* \
-    gfortran \
-    flex \
-    hwloc \
-  && apt-get clean
+    dh-autoreconf python3-venv python3-dev python3-pip git \
+    ca-certificates ssh make libtinfo* initramfs-tools libelf-dev \
+    wget build-essential autoconf automake libtool \
+    pkg-config libnuma* gfortran flex hwloc cmake
 
-# Requires cmake > 3.22 
-RUN mkdir -p /opt/cmake  \
-  && wget --no-check-certificate --quiet -O - https://cmake.org/files/v3.22/cmake-3.22.2-linux-x86_64.tar.gz | tar --strip-components=1 -xz -C /opt/cmake
-
-ENV ROCM_HOME=/opt/rocm \
+ENV ROCM_HOME=/opt/rocm\
     UCX_HOME=/opt/ucx \
     OMPI_HOME=/opt/ompi
 
+# Adding ROCM
+ENV PATH=$ROCM_HOME/bin:$PATH \
+    LD_LIBRARY_PATH=$ROCM_HOME/lib:$ROCM_HOME/lib/llvm/lib:$LD_LIBRARY_PATH
+
 # Until rocm base has it fixed
-RUN ln -s /opt/rocm/llvm/bin/offload-arch /opt/rocm/bin/offload-arch
-
-# Install tmpi
-RUN curl https://raw.githubusercontent.com/Azrael3000/tmpi/master/tmpi -o /usr/local/bin/tmpi
-
-# Adding rocm/cmake to the Environment 
-ENV PATH=$ROCM_HOME/bin:$ROCM_HOME/profiler/bin:$ROCM_HOME/opencl/bin:/opt/cmake/bin:$PATH \
-    LD_LIBRARY_PATH=$ROCM_HOME/lib:$ROCM_HOME/lib64:$ROCM_HOME/llvm/lib:$LD_LIBRARY_PATH \
-    C_INCLUDE_PATH=$ROCM_HOME/include:$C_INCLUDE_PATH \
-    CPLUS_INCLUDE_PATH=$ROCM_HOME/include:$CPLUS_INCLUDE_PATH \
-    CPATH=$ROCM_HOME/include:$CPATH \
-    INCLUDE=$ROCM_HOME/include:$INCLUDE
-
-WORKDIR /tmp
+RUN ln -s /opt/rocm/llvm/bin/offload-arch /opt/rocm/bin/offload-arch | echo "offload-arch already exis"
 
 # Install UCX
 RUN cd /tmp/ \
@@ -73,10 +42,14 @@ RUN cd /tmp/ \
         --without-knem \
         --without-xpmem  \
         --without-cuda \
+        --without-java \
+        --enable-mt \
         --enable-optimizations  \
         --disable-logging \
         --disable-debug \
         --disable-examples \
+        --disable-assertions \
+        --disable-params-check \
     && make -j ${nproc} \
     && make install
 
@@ -87,16 +60,23 @@ RUN cd /tmp \
     && ./autogen.pl \
     && mkdir build \
     && cd build \
-    && ../configure --prefix=$OMPI_HOME --with-ucx=$UCX_HOME \
-        CC=amdclang CXX=amdclang++ FC=amdflang F90=amdflang \
-        --enable-mca-no-build=btl-uct  \
+    && ../configure CC=amdclang CXX=amdclang++ FC=amdflang F90=amdflang \
+        --prefix=$OMPI_HOME \
+        --with-ucx=$UCX_HOME \
+        --with-rocm=$ROCM_HOME \
+        --enable-mca-no-build=btl-uct \
         --without-verbs \
-        --with-pmix  \
-        --enable-mpi \
-        --enable-mpi-fortran=yes \
+        --enable-mpi1-compatibility \
+        --enable-mpi-fortran=no \
         --disable-debug \
+        --disable-oshmem \
+        --disable-man-pages \
     && make -j ${nproc} \
     && make install
+
+# UCX config
+ENV UCX_WARN_UNUSED_ENV_VARS=n
+ENV UCX_TLS=sm,self,rocm,rocm_copy,rocm_ipc
 
 # Cleanup
 RUN rm -rf /tmp/ucx && rm -rf /tmp/ompi
@@ -114,14 +94,6 @@ ENV PATH=$OMPI_HOME/bin:$UCX_HOME/bin:$PATH \
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
-##############################################################
-# Additional Devito requirements
-##############################################################
-
-# Additional utils and python3
-RUN apt-get update && \
-    apt-get install -y dh-autoreconf python3-venv python3-dev python3-pip
-
 RUN apt-get clean && apt-get autoclean && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
@@ -132,7 +104,7 @@ CMD ["/bin/bash"]
 # AOMP for GPUs (OpenMP offloading)
 ########################################################################
 # This will only trigger if arch is aomp since the final stage depends on it
-FROM sdk-base as amdclang
+FROM sdk-base AS amdclang
 
 # MPI env
 ENV OMPI_CC="amdclang"
@@ -147,7 +119,7 @@ ENV DEVITO_LANGUAGE="openmp"
 # HIPCC for GPUs (HIP)
 ########################################################################
 # This will only trigger if arch is hip since the final stage depends on it
-FROM sdk-base as hip
+FROM sdk-base AS hip
 
 # MPI env
 ENV OMPI_CC="hipcc"

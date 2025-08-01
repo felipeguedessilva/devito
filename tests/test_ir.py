@@ -5,6 +5,7 @@ from sympy import S
 from conftest import EVAL, skipif  # noqa
 from devito import (Eq, Inc, Grid, Constant, Function, TimeFunction, # noqa
                     Operator, Dimension, SubDimension, switchconfig)
+from devito.ir.cgen import ccode
 from devito.ir.equations import LoweredEq
 from devito.ir.equations.algorithms import dimension_sort
 from devito.ir.iet import Iteration, FindNodes
@@ -12,11 +13,12 @@ from devito.ir.support.basic import (IterationInstance, TimedAccess, Scope,
                                      Vector, AFFINE, REGULAR, IRREGULAR, mocksym0,
                                      mocksym1)
 from devito.ir.support.space import (NullInterval, Interval, Forward, Backward,
-                                     IterationSpace)
+                                     IntervalGroup, IterationSpace)
 from devito.ir.support.guards import GuardOverflow
-from devito.symbolics import DefFunction, FieldFromPointer, ccode
+from devito.symbolics import DefFunction, FieldFromPointer
 from devito.tools import prod
-from devito.types import Array, CriticalRegion, Jump, Scalar, Symbol
+from devito.tools.data_structures import frozendict
+from devito.types import Array, Bundle, CriticalRegion, Jump, Scalar, Symbol
 
 
 class TestVectorHierarchy:
@@ -507,6 +509,24 @@ class TestSpace:
         assert iy.switch(x) == ix
         assert ix.switch(y).switch(x) == ix
 
+    def test_space_intersection(self, x, y):
+        ig0 = IntervalGroup([Interval(x, 1, -1)])
+        ig1 = IntervalGroup([Interval(x, 2, -2), Interval(y, 3, -3)])
+
+        ig = IntervalGroup.generate('intersection', ig0, ig1)
+
+        assert len(ig) == 1
+        assert ig[0] == Interval(x, 2, -2)
+
+        # Now the same but with IterationSpaces
+        ispace0 = IterationSpace(ig0)
+        ispace1 = IterationSpace(ig1)
+
+        ispace = IterationSpace.intersection(ispace0, ispace1)
+
+        assert len(ispace) == 1
+        assert ispace.intervals == ig
+
 
 class TestDependenceAnalysis:
 
@@ -592,9 +612,9 @@ class TestDependenceAnalysis:
         """
         expr = LoweredEq(EVAL(expr, ti0.base, ti1.base, fa))
 
-        # Force innatural flow, only to stress the compiler to see if it was
+        # Force unnatural flow, only to stress the compiler to see if it is
         # capable of detecting anti-dependences
-        expr.ispace._directions = {i: Forward for i in expr.ispace.directions}
+        expr.ispace._directions = frozendict({i: Forward for i in expr.ispace.directions})
 
         scope = Scope(expr)
         deps = scope.d_all
@@ -690,10 +710,10 @@ class TestDependenceAnalysis:
         exprs = [LoweredEq(i) for i in EVAL(exprs, ti0.base, ti1.base, ti3.base, fa)]
         expected = [tuple(i.split(',')) for i in expected]
 
-        # Force innatural flow, only to stress the compiler to see if it was
+        # Force unnatural flow, only to stress the compiler to see if it is
         # capable of detecting anti-dependences
         for i in exprs:
-            i.ispace._directions = {i: Forward for i in i.ispace.directions}
+            i.ispace._directions = frozendict({i: Forward for i in i.ispace.directions})
 
         scope = Scope(exprs)
         assert len(scope.d_all) == len(expected)
@@ -885,6 +905,32 @@ class TestDependenceAnalysis:
         assert len(scope.writes[mocksym1]) == 1
         assert len(scope.reads[mocksym1]) == 2
         assert len(scope.d_all) == 9
+
+    def test_bundle_components(self):
+        grid = Grid(shape=(4, 4))
+        x, y = grid.dimensions
+
+        f = Function(name='f', grid=grid)
+        g = Function(name='g', grid=grid)
+        v = Function(name='v', grid=grid)
+        w = Function(name='w', grid=grid)
+        u0 = Function(name='u0', grid=grid)
+        u1 = Function(name='u1', grid=grid)
+
+        fg = Bundle(name='fg', components=(f, g))
+        vw = Bundle(name='vw', components=(v, w))
+
+        exprs = [Eq(fg.indexify(), 1),
+                 Eq(u0.indexify(), fg[0, x, y] + 2),
+                 Eq(vw[0, x, y], 3),
+                 Eq(u1.indexify(), vw[1, x, y] + 4)]
+        exprs = [LoweredEq(i) for i in exprs]
+
+        scope = Scope(exprs)
+        assert len(scope.d_all) == 1
+        assert len(scope.d_flow) == 1
+        dep, = scope.d_flow
+        assert dep.function is f
 
 
 class TestParallelismAnalysis:

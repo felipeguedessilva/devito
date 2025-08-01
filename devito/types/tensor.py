@@ -2,6 +2,11 @@ from collections import OrderedDict
 from functools import cached_property
 
 import numpy as np
+try:
+    from sympy.matrices.matrixbase import MatrixBase
+except ImportError:
+    # Before 1.13
+    from sympy.matrices.matrices import MatrixBase
 from sympy.core.sympify import converter as sympify_converter
 
 from devito.finite_differences import Differentiable
@@ -69,12 +74,28 @@ class TensorFunction(AbstractTensor):
     _class_priority = 10
     _op_priority = Differentiable._op_priority + 1.
 
+    __rkwargs__ = AbstractTensor.__rkwargs__ + ('dimensions', 'space_order')
+
     def __init_finalize__(self, *args, **kwargs):
+        super().__init_finalize__(*args, **kwargs)
         grid = kwargs.get('grid')
         dimensions = kwargs.get('dimensions')
-        inds, _ = Function.__indices_setup__(grid=grid,
-                                             dimensions=dimensions)
+        inds, _ = Function.__indices_setup__(grid=grid, dimensions=dimensions)
         self._space_dimensions = inds
+
+    @classmethod
+    def _component_kwargs(cls, inds, **kwargs):
+        """
+        Get the kwargs for a single component
+        from the kwargs of the TensorFunction.
+        """
+        kw = {}
+        for k, v in kwargs.items():
+            if isinstance(v, MatrixBase):
+                kw[k] = v[inds]
+            else:
+                kw[k] = v
+        return kw
 
     @classmethod
     def __subfunc_setup__(cls, *args, **kwargs):
@@ -105,10 +126,12 @@ class TensorFunction(AbstractTensor):
             start = i if (symm or diag) else 0
             stop = i + 1 if diag else len(dims)
             for j in range(start, stop):
-                kwargs["name"] = "%s_%s%s" % (name, d.name, dims[j].name)
-                kwargs["staggered"] = (stagg[i][j] if stagg is not None
-                                       else (NODE if i == j else (d, dims[j])))
-                funcs2[j] = cls._sub_type(**kwargs)
+                staggj = (stagg[i][j] if stagg is not None
+                          else (NODE if i == j else (d, dims[j])))
+                sub_kwargs = cls._component_kwargs((i, j), **kwargs)
+                sub_kwargs.update({'name': f"{name}_{d.name}{dims[j].name}",
+                                   'staggered': staggj})
+                funcs2[j] = cls._sub_type(**sub_kwargs)
             funcs.append(funcs2)
 
         # Symmetrize and fill diagonal if symmetric
@@ -160,9 +183,18 @@ class TensorFunction(AbstractTensor):
         return self._space_dimensions
 
     @cached_property
+    def root_dimensions(self):
+        """Tuple of root Dimensions of the physical space Dimensions."""
+        return tuple(d.root for d in self.space_dimensions)
+
+    @cached_property
     def space_order(self):
         """The space order for all components."""
-        return ({a.space_order for a in self} - {None}).pop()
+        orders = self.applyfunc(lambda x: x.space_order)
+        if len(set(orders)) > 1:
+            return orders
+        else:
+            return orders[0]
 
     @property
     def is_diagonal(self):
@@ -209,13 +241,14 @@ class TensorFunction(AbstractTensor):
         comps = []
         func = vec_func(self)
         ndim = len(self.space_dimensions)
+        space_dims = self.root_dimensions
         shift_x0 = make_shift_x0(shift, (ndim, ndim))
         order = order or self.space_order
         for i in range(len(self.space_dimensions)):
             comps.append(sum([getattr(self[j, i], 'd%s' % d.name)
                               (x0=shift_x0(shift, d, i, j), fd_order=order,
                                method=method, w=w)
-                              for j, d in enumerate(self.space_dimensions)]))
+                              for j, d in enumerate(space_dims)]))
         return func._new(comps)
 
     @property
@@ -251,13 +284,14 @@ class TensorFunction(AbstractTensor):
         comps = []
         func = vec_func(self)
         order = order or self.space_order
+        space_dims = self.root_dimensions
         ndim = len(self.space_dimensions)
         shift_x0 = make_shift_x0(shift, (ndim, ndim))
         for j in range(ndim):
             comps.append(sum([getattr(self[j, i], 'd%s2' % d.name)
                               (x0=shift_x0(shift, d, j, i), fd_order=order,
                                method=method, w=w)
-                              for i, d in enumerate(self.space_dimensions)]))
+                              for i, d in enumerate(space_dims)]))
         return func._new(comps)
 
     def grad(self, shift=None, order=None, method=None, **kwargs):
@@ -310,9 +344,10 @@ class VectorFunction(TensorFunction):
         stagg = kwargs.get("staggered", None)
         name = kwargs.get("name")
         for i, d in enumerate(dims):
-            kwargs["name"] = "%s_%s" % (name, d.name)
-            kwargs["staggered"] = stagg[i] if stagg is not None else d
-            funcs.append(cls._sub_type(**kwargs))
+            sub_kwargs = cls._component_kwargs(i, **kwargs)
+            sub_kwargs.update({'name': f"{name}_{d.name}",
+                               'staggered': stagg[i] if stagg is not None else d})
+            funcs.append(cls._sub_type(**sub_kwargs))
 
         return funcs
 
@@ -343,9 +378,10 @@ class VectorFunction(TensorFunction):
         w = kwargs.get('weights', kwargs.get('w'))
         shift_x0 = make_shift_x0(shift, (len(self.space_dimensions),))
         order = order or self.space_order
+        space_dims = self.root_dimensions
         return sum([getattr(self[i], 'd%s' % d.name)(x0=shift_x0(shift, d, None, i),
                                                      fd_order=order, method=method, w=w)
-                    for i, d in enumerate(self.space_dimensions)])
+                    for i, d in enumerate(space_dims)])
 
     @property
     def laplace(self):
@@ -375,9 +411,10 @@ class VectorFunction(TensorFunction):
         func = vec_func(self)
         shift_x0 = make_shift_x0(shift, (len(self.space_dimensions),))
         order = order or self.space_order
+        space_dims = self.root_dimensions
         comps = [sum([getattr(s, 'd%s2' % d.name)(x0=shift_x0(shift, d, None, i),
                                                   fd_order=order, w=w, method=method)
-                      for i, d in enumerate(self.space_dimensions)])
+                      for i, d in enumerate(space_dims)])
                  for s in self]
         return func._new(comps)
 
@@ -402,7 +439,7 @@ class VectorFunction(TensorFunction):
             raise AttributeError("Curl only supported for 3D VectorFunction")
         # The curl of a VectorFunction is a VectorFunction
         w = kwargs.get('weights', kwargs.get('w'))
-        dims = self.space_dimensions
+        dims = self.root_dimensions
         derivs = ['d%s' % d.name for d in dims]
         shift_x0 = make_shift_x0(shift, (len(dims), len(dims)))
         order = order or self.space_order
@@ -443,9 +480,10 @@ class VectorFunction(TensorFunction):
         ndim = len(self.space_dimensions)
         shift_x0 = make_shift_x0(shift, (ndim, ndim))
         order = order or self.space_order
+        space_dims = self.root_dimensions
         comps = [[getattr(f, 'd%s' % d.name)(x0=shift_x0(shift, d, i, j), w=w,
                                              fd_order=order, method=method)
-                  for j, d in enumerate(self.space_dimensions)]
+                  for j, d in enumerate(space_dims)]
                  for i, f in enumerate(self)]
         return func._new(comps)
 

@@ -50,7 +50,8 @@ class AbstractInterval:
     def _rebuild(self):
         return
 
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def relaxed(self):
         return
 
@@ -377,10 +378,16 @@ class IntervalGroup(Ordering):
 
         >>> ig = IntervalGroup.generate('intersection', ig0, ig1, ig2)
         """
+        if op == 'intersection':
+            dims = set.intersection(*[set(ig.dimensions) for ig in interval_groups])
+        else:
+            dims = set().union(*[ig.dimensions for ig in interval_groups])
+
         mapper = {}
         for ig in interval_groups:
             for i in ig:
-                mapper.setdefault(i.dim, []).append(i)
+                if i.dim in dims:
+                    mapper.setdefault(i.dim, []).append(i)
 
         intervals = []
         for v in mapper.values():
@@ -1055,6 +1062,10 @@ class IterationSpace(Space):
     @property
     def innermost(self):
         return self[-1]
+
+    @cached_property
+    def concrete(self):
+        return self.project(lambda d: not d.is_Virtual)
 
     @cached_property
     def itintervals(self):

@@ -2,6 +2,7 @@
 
 from functools import cached_property
 from subprocess import PIPE, Popen, DEVNULL, run
+from pathlib import Path
 import ctypes
 import re
 import os
@@ -17,20 +18,25 @@ from devito.tools import as_tuple, all_equal, memoized_func
 
 __all__ = ['platform_registry', 'get_cpu_info', 'get_gpu_info', 'get_nvidia_cc',
            'get_cuda_path', 'get_hip_path', 'check_cuda_runtime', 'get_m1_llvm_path',
-           'Platform', 'Cpu64', 'Intel64', 'IntelSkylake', 'Amd', 'Arm', 'Power',
-           'Device', 'NvidiaDevice', 'AmdDevice', 'IntelDevice',
+           'get_advisor_path', 'Platform', 'Cpu64', 'Intel64', 'IntelSkylake', 'Amd',
+           'Arm', 'Power', 'Device', 'NvidiaDevice', 'AmdDevice', 'IntelDevice',
            # Brand-agnostic
            'ANYCPU', 'ANYGPU',
            # Intel CPUs
            'INTEL64', 'SNB', 'IVB', 'HSW', 'BDW', 'KNL', 'KNL7210',
            'SKX', 'KLX', 'CLX', 'CLK', 'SPR',
+           # AMD CPUs
+           'AMD',
            # ARM CPUs
-           'AMD', 'ARM', 'AppleArm', 'M1', 'M2', 'M3',
+           'ARM', 'AppleArm', 'M1', 'M2', 'M3',
            'Graviton', 'GRAVITON2', 'GRAVITON3', 'GRAVITON4',
+           'Cortex', 'NvidiaArm', 'GRACE',
            # Other legacy CPUs
            'POWER8', 'POWER9',
            # Generic GPUs
            'AMDGPUX', 'NVIDIAX', 'INTELGPUX',
+           # Nvidia GPUs
+           'VOLTA', 'AMPERE', 'HOPPER', 'BLACKWELL',
            # Intel GPUs
            'PVC', 'INTELGPUMAX', 'MAX1100', 'MAX1550']
 
@@ -173,7 +179,6 @@ def get_gpu_info():
         homogeneous, otherwise None.
         """
         if gpu_infos == []:
-            warning('No graphics cards detected')
             return {}
 
         # Check must ignore physical IDs as they may differ
@@ -186,7 +191,7 @@ def get_gpu_info():
 
         warning('Different models of graphics cards detected')
 
-        return {}
+        return {'ncards': len(gpu_infos)}
 
     # Parse textual gpu info into a dict
 
@@ -224,7 +229,7 @@ def get_gpu_info():
         for i in ['total', 'free', 'used']:
             def make_cbk(i):
                 def cbk(deviceid=0):
-                    info_cmd = ['nvidia-smi', '--query-gpu=memory.%s' % i, '--format=csv']
+                    info_cmd = ['nvidia-smi', f'--query-gpu=memory.{i}', '--format=csv']
                     proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
                     raw_info = str(proc.stdout.read())
 
@@ -246,7 +251,7 @@ def get_gpu_info():
 
                 return cbk
 
-            gpu_info['mem.%s' % i] = make_cbk(i)
+            gpu_info[f'mem.{i}'] = make_cbk(i)
 
         return gpu_info
 
@@ -268,7 +273,7 @@ def get_gpu_info():
         for line in lines:
             if 'GPU' in line:
                 # Product
-                pattern = r'GPU\[(\d+)\].*?Card series:\s*(.*?)\s*$'
+                pattern = r'GPU\[(\d+)\].*?Card [sS]eries:\s*(.*?)\s*$'
                 match1 = re.match(pattern, line)
 
                 if match1:
@@ -278,7 +283,7 @@ def get_gpu_info():
                     gpu_infos[gid]['product'] = match1.group(2)
 
                 # Model
-                pattern = r'GPU\[(\d+)\].*?Card model:\s*(.*?)\s*$'
+                pattern = r'GPU\[(\d+)\].*?Card [mM]odel:\s*(.*?)\s*$'
                 match2 = re.match(pattern, line)
 
                 if match2:
@@ -301,10 +306,10 @@ def get_gpu_info():
                 def cbk(deviceid=0):
                     try:
                         # Should only contain Used and total
-                        assert len(info['card%s' % deviceid]) == 2
-                        used = [int(v) for k, v in info['card%s' % deviceid].items()
+                        assert len(info[f'card{deviceid}']) == 2
+                        used = [int(v) for k, v in info[f'card{deviceid}'].items()
                                 if 'Used' in k][0]
-                        total = [int(v) for k, v in info['card%s' % deviceid].items()
+                        total = [int(v) for k, v in info[f'card{deviceid}'].items()
                                  if 'Used' not in k][0]
                         free = total - used
                         return {'total': total, 'free': free, 'used': used}[i]
@@ -316,15 +321,82 @@ def get_gpu_info():
 
                 return cbk
 
+            gpu_info[f'mem.{i}'] = make_cbk(i)
+
+        gpu_info['architecture'] = 'unspecified'
+        gpu_info['vendor'] = 'AMD'
+
+        return gpu_info
+
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    # *** Third try: `sycl-ls`, clearly only works with Intel cards
+    try:
+        gpu_infos = {}
+
+        # sycl-ls sometimes finds gpu twice with opencl and without so
+        # we need to make sure we don't get duplicates
+        selected_platform = None
+        platform_block = ""
+
+        proc = Popen(["sycl-ls", "--verbose"], stdout=PIPE, stderr=DEVNULL, text=True)
+        sycl_output, _ = proc.communicate()
+
+        # Extract platform blocks
+        platforms = re.findall(r"Platform \[#(\d+)\]:([\s\S]*?)(?=Platform \[#\d+\]:|$)",
+                               sycl_output)
+
+        # Select Level-Zero if available, otherwise use OpenCL
+        for platform_id, platform_content in platforms:
+            if "Intel(R) Level-Zero" in platform_content:
+                selected_platform = platform_id
+                platform_block = platform_content
+                break
+            elif "Intel(R) OpenCL Graphics" in platform_content and \
+                    selected_platform is None:
+                selected_platform = platform_id
+                platform_block = platform_content
+
+        # Extract GPU devices from the selected platform
+        devices = re.findall(r"Device \[#(\d+)\]:([\s\S]*?)(?=Device \[#\d+\]:|$)",
+                             platform_block)
+
+        for device_id, device_block in devices:
+            if re.search(r"^\s*Type\s*:\s*gpu", device_block, re.MULTILINE):
+                name_match = re.search(r"^\s*Name\s*:\s*(.+)", device_block, re.MULTILINE)
+
+                if name_match:
+                    name = name_match.group(1).strip()
+
+                    # Store GPU info with correct physical ID
+                    gpu_infos[device_id] = {
+                        "physicalid": device_id,
+                        "product": name
+                    }
+
+        gpu_info = homogenise_gpus(list(gpu_infos.values()))
+
+        # Also attach callbacks to retrieve instantaneous memory info
+        # Now this should be done using xpu-smi but for some reason
+        # it throws a lot of weird errors in docker so skipping for now
+        for i in ['total', 'free', 'used']:
+            def make_cbk(i):
+                def cbk(deviceid=0):
+                    return None
+                return cbk
+
             gpu_info['mem.%s' % i] = make_cbk(i)
 
-        gpu_infos['architecture'] = 'AMD'
+        gpu_info['architecture'] = 'unspecified'
+        gpu_info['vendor'] = 'INTEL'
+
         return gpu_info
 
     except OSError:
         pass
 
-    # *** Second try: `lshw`
+    # *** Fourth try: `lshw`
     try:
         info_cmd = ['lshw', '-C', 'video']
         proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
@@ -369,7 +441,7 @@ def get_gpu_info():
     except OSError:
         pass
 
-    # Third try: `lspci`, which is more readable but less detailed than `lshw`
+    # Fifth try: `lspci`, which is more readable but less detailed than `lshw`
     try:
         info_cmd = ['lspci']
         proc = Popen(info_cmd, stdout=PIPE, stderr=DEVNULL)
@@ -385,7 +457,7 @@ def get_gpu_info():
         gpu_infos = []
         for line in lines:
             # Graphics cards are listed as VGA or 3D controllers in lspci
-            if 'VGA' in line or '3D' in line:
+            if any(i in line for i in ('VGA', '3D', 'Display')):
                 gpu_info = {}
                 # Lines produced by lspci command are of the form:
                 #   xxxx:xx:xx.x Device Type: Name
@@ -457,6 +529,27 @@ def get_cuda_path():
                 return cuda_home
 
     return None
+
+
+@memoized_func
+def get_advisor_path():
+    """
+    Detect if Intel Advisor is installed on the machine and return
+    its location if it is.
+    """
+    path = None
+
+    env_path = os.environ["PATH"]
+    env_path_dirs = env_path.split(":")
+
+    for env_path_dir in env_path_dirs:
+        # intel/oneapi/advisor is the directory for Intel oneAPI
+        if "intel/advisor" in env_path_dir or "intel/oneapi/advisor" in env_path_dir:
+            path = Path(env_path_dir)
+            if path.name.startswith('bin'):
+                return path.parent
+
+    return path
 
 
 @memoized_func
@@ -666,8 +759,15 @@ class Platform:
         Number of items of type `dtype` that can be transferred in a single
         memory transaction.
         """
-        assert self.max_mem_trans_nbytes % np.dtype(dtype).itemsize == 0
-        return int(self.max_mem_trans_nbytes / np.dtype(dtype).itemsize)
+        itemsize = np.dtype(dtype).itemsize
+
+        # NOTE: This method conservatively uses the node's `max_mem_trans_size`,
+        # instead of self's, so that we always pad by a compatible amount should
+        # the user switch target platforms dynamically
+        mmtb = node_max_mem_trans_nbytes(self)
+        assert mmtb % itemsize == 0
+
+        return int(mmtb / itemsize)
 
     def limits(self, compiler=None, language=None):
         """
@@ -678,6 +778,12 @@ class Platform:
             'max-par-dims': sys.maxsize,
             'max-block-dims': sys.maxsize,
         }
+
+    def supports(self, query, language=None):
+        """
+        Return True if the platform supports a given feature, False otherwise.
+        """
+        return False
 
 
 class Cpu64(Platform):
@@ -735,7 +841,7 @@ class Cpu64(Platform):
         try:
             return int(lscpu()['NUMA node(s)'])
         except (ValueError, TypeError, KeyError):
-            warning("NUMA domain count autodetection failed")
+            warning("NUMA domain count autodetection failed, assuming 1")
             return 1
 
     @cached_property
@@ -791,6 +897,31 @@ class Graviton(Arm):
             return 'neoverse-n1'
 
 
+class Cortex(Arm):
+
+    @property
+    def version(self):
+        return int(self.name.split('cortexa')[-1])
+
+    @cached_property
+    def march(self):
+        return 'armv8-a+crc+simd'
+
+    @cached_property
+    def mtune(self):
+        return f'cortex-a{self.version}'
+
+
+class NvidiaArm(Arm):
+
+    @cached_property
+    def march(self):
+        if self.name == 'grace':
+            return 'neoverse-v2'
+        else:
+            return 'native'
+
+
 class Amd(Cpu64):
 
     known_isas = ('cpp', 'sse', 'avx', 'avx2')
@@ -806,7 +937,8 @@ class Device(Platform):
 
     def __init__(self, name, cores_logical=None, cores_physical=None, isa='cpp',
                  max_threads_per_block=1024, max_threads_dimx=1024,
-                 max_threads_dimy=1024, max_threads_dimz=64):
+                 max_threads_dimy=1024, max_threads_dimz=64,
+                 max_thread_block_cluster_size=8):
         super().__init__(name)
 
         cpu_info = get_cpu_info()
@@ -819,6 +951,7 @@ class Device(Platform):
         self.max_threads_dimx = max_threads_dimx
         self.max_threads_dimy = max_threads_dimy
         self.max_threads_dimz = max_threads_dimz
+        self.max_thread_block_cluster_size = max_thread_block_cluster_size
 
     @classmethod
     def _mro(cls):
@@ -895,6 +1028,55 @@ class NvidiaDevice(Device):
                 return 'tesla'
         return None
 
+    def supports(self, query, language=None):
+        if language != 'cuda':
+            return False
+
+        cc = get_nvidia_cc()
+        if cc is None:
+            # Something off with `get_nvidia_cc` on this system
+            warning(f"Couldn't establish if `query={query}` is supported on this "
+                    "system. Assuming it is not.")
+            return False
+        elif query == 'async-loads' and cc >= 80:
+            # Asynchronous pipeline loads -- introduced in Ampere
+            return True
+        elif query in ('tma', 'thread-block-cluster') and cc >= 90:
+            # Tensor Memory Accelerator -- introduced in Hopper
+            return True
+        else:
+            return False
+
+
+class Volta(NvidiaDevice):
+    pass
+
+
+class Ampere(Volta):
+
+    def supports(self, query, language=None):
+        if query == 'async-loads':
+            return True
+        else:
+            return super().supports(query, language)
+
+
+class Hopper(Ampere):
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('max_thread_block_cluster_size', 16)
+        super().__init__(*args, **kwargs)
+
+    def supports(self, query, language=None):
+        if query in ('tma', 'thread-block-cluster'):
+            return True
+        else:
+            return super().supports(query, language)
+
+
+class Blackwell(Hopper):
+    pass
+
 
 class AmdDevice(Device):
 
@@ -929,6 +1111,42 @@ class AmdDevice(Device):
             return fallback
 
 
+@memoized_func
+def node_max_mem_trans_nbytes(platform):
+    """
+    Return the maximum memory transaction size in bytes for the underlying
+    node, which, as such, takes into account all available platforms.
+    """
+    mmtb0 = platform.max_mem_trans_nbytes
+
+    if isinstance(platform, Cpu64):
+        gpu_info = get_gpu_info()
+        if not gpu_info:
+            # This node may simply not have a GPU
+            return mmtb0
+
+        mapper = {
+            'NVIDIA': NvidiaDevice,
+            'AMD': AmdDevice,
+            'INTEL': IntelDevice,
+        }
+        try:
+            mmtb1 = mapper[gpu_info['vendor']].max_mem_trans_nbytes
+            return max(mmtb0, mmtb1)
+        except KeyError:
+            # Fallback -- act even more conservatively
+            mmtb1 = max(p.max_mem_trans_nbytes for p in
+                        [NvidiaDevice, AmdDevice, IntelDevice])
+            mmtb = max(mmtb0, mmtb1)
+            warning("Unable to determine GPU type, assuming a maximum memory "
+                    f"transaction size of {mmtb} bytes")
+            return mmtb
+    elif isinstance(platform, Device):
+        return max(Cpu64.max_mem_trans_nbytes, mmtb0)
+    else:
+        assert False, f"Unknown platform type: {type(platform)}"
+
+
 # CPUs
 ANYCPU = Cpu64('cpu64')
 CPU64_DUMMY = Intel64('cpu64-dummy', cores_logical=2, cores_physical=1, isa='sse')
@@ -953,6 +1171,9 @@ GRAVITON4 = Graviton('graviton4')
 M1 = AppleArm('m1')
 M2 = AppleArm('m2')
 M3 = AppleArm('m3')
+CORTEX = Cortex('cortex')
+CORTEXA76 = Cortex('cortexa76')
+GRACE = NvidiaArm('grace')
 
 AMD = Amd('amd')
 
@@ -963,6 +1184,10 @@ POWER9 = Power('power9')
 ANYGPU = Cpu64('gpu')
 
 NVIDIAX = NvidiaDevice('nvidiaX')
+VOLTA = Volta('volta')
+AMPERE = Ampere('ampere')
+HOPPER = Hopper('hopper')
+BLACKWELL = Blackwell('blackwell')
 
 AMDGPUX = AmdDevice('amdgpuX')
 

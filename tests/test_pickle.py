@@ -1,6 +1,7 @@
+import ctypes
 import pickle as pickle0
-import cloudpickle as pickle1
 
+import cloudpickle as pickle1
 import pytest
 import numpy as np
 from sympy import Symbol
@@ -8,7 +9,7 @@ from sympy import Symbol
 from devito import (Constant, Eq, Function, TimeFunction, SparseFunction, Grid,
                     Dimension, SubDimension, ConditionalDimension, IncrDimension,
                     TimeDimension, SteppingDimension, Operator, MPI, Min, solve,
-                    PrecomputedSparseTimeFunction)
+                    PrecomputedSparseTimeFunction, SubDomain)
 from devito.ir import Backward, Forward, GuardFactor, GuardBound, GuardBoundNext
 from devito.data import LEFT, OWNED
 from devito.finite_differences.tools import direct, transpose, left, right, centered
@@ -18,13 +19,22 @@ from devito.mpi.routines import (MPIStatusObject, MPIMsgEnriched, MPIRequestObje
 from devito.types import (Array, CustomDimension, Symbol as dSymbol, Scalar,
                           PointerArray, Lock, PThreadArray, SharedData, Timer,
                           DeviceID, NPThreads, ThreadID, TempFunction, Indirection,
-                          FIndexed)
+                          FIndexed, ComponentAccess)
 from devito.types.basic import BoundSymbol, AbstractSymbol
 from devito.tools import EnrichedTuple
 from devito.symbolics import (IntDiv, ListInitializer, FieldFromPointer,
-                              CallFromPointer, DefFunction)
+                              CallFromPointer, DefFunction, Cast, SizeOf,
+                              pow_to_mul)
 from examples.seismic import (demo_model, AcquisitionGeometry,
                               TimeAxis, RickerSource, Receiver)
+
+
+class SD(SubDomain):
+    name = 'sd'
+
+    def define(self, dimensions):
+        x, y, z = dimensions
+        return {x: x, y: ('middle', 1, 1), z: ('right', 2)}
 
 
 @pytest.mark.parametrize('pickle', [pickle0, pickle1])
@@ -90,9 +100,15 @@ class TestBasic:
         assert new_t.left == tup.left
         assert new_t.right == tup.right
 
-    def test_function(self, pickle):
+    @pytest.mark.parametrize('on_sd', [False, True])
+    def test_function(self, pickle, on_sd):
         grid = Grid(shape=(3, 3, 3))
-        f = Function(name='f', grid=grid)
+
+        if on_sd:
+            sd = SD(grid=grid)
+            f = Function(name='f', grid=sd)
+        else:
+            f = Function(name='f', grid=grid)
         f.data[0] = 1.
 
         pkl_f = pickle.dumps(f)
@@ -304,6 +320,7 @@ class TestBasic:
         assert cd.name == new_cd.name
         assert cd.parent.name == new_cd.parent.name
         assert cd.factor == new_cd.factor
+        assert cd.symbolic_factor == new_cd.symbolic_factor
         assert cd.condition == new_cd.condition
 
     def test_incr_dimension(self, pickle):
@@ -399,6 +416,20 @@ class TestBasic:
         assert new_fi.accessor == 'fL'
         assert new_fi.indices == (x+1, y, z-2)
         assert new_fi.strides_map == fi.strides_map
+
+    def test_component_access(self, pickle):
+        grid = Grid(shape=(3, 3, 3))
+        x, y, z = grid.dimensions
+
+        f = Function(name='f', grid=grid)
+
+        ca = ComponentAccess(f.indexify(), 1)
+
+        pkl_ca = pickle.dumps(ca)
+        new_ca = pickle.loads(pkl_ca)
+
+        assert new_ca.index == 1
+        assert new_ca.function.name == f.name
 
     def test_symbolics(self, pickle):
         a = Symbol('a')
@@ -542,7 +573,7 @@ class TestBasic:
         grid = Grid(shape=(3,))
         x = grid.dimensions[0]
         x0 = eval(x0)
-        f = Function(name='f', grid=grid, space_order=2)
+        f = Function(name='f', grid=grid, space_order=4)
         dfdx = f.diff(x, order=deriv_order, fd_order=fd_order, side=side,
                       x0=x0, method=method, weights=weights)
 
@@ -567,13 +598,44 @@ class TestBasic:
 
         eq = Eq(f, f+1, implicit_dims=xs)
 
-        pkl_eq = pickle0.dumps(eq)
-        new_eq = pickle0.loads(pkl_eq)
+        pkl_eq = pickle.dumps(eq)
+        new_eq = pickle.loads(pkl_eq)
 
         assert new_eq.lhs.name == f.name
         assert str(new_eq.rhs) == 'f(x) + 1'
         assert new_eq.implicit_dims[0].name == 'xs'
-        assert new_eq.implicit_dims[0].factor.data == 4
+        assert new_eq.implicit_dims[0].factor == 4
+
+    @pytest.mark.parametrize('typ', [ctypes.c_float, 'struct truct'])
+    def test_Cast(self, pickle, typ):
+        a = Symbol('a')
+        un = Cast(a, dtype=typ)
+
+        pkl_un = pickle.dumps(un)
+        new_un = pickle.loads(pkl_un)
+
+        assert un == new_un
+
+    @pytest.mark.parametrize('typ', [ctypes.c_float, 'struct truct'])
+    def test_SizeOf(self, pickle, typ):
+        un = SizeOf(typ)
+
+        pkl_un = pickle.dumps(un)
+        new_un = pickle.loads(pkl_un)
+
+        assert un == new_un
+
+    def test_pow_to_mul(self, pickle):
+        grid = Grid(shape=(3,))
+        f = Function(name='f', grid=grid)
+        expr = pow_to_mul(f ** 2)
+
+        assert expr.is_Mul
+
+        pkl_expr = pickle.dumps(expr)
+        new_expr = pickle.loads(pkl_expr)
+
+        assert new_expr.is_Mul
 
 
 class TestAdvanced:

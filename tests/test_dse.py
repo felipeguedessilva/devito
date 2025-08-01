@@ -11,7 +11,7 @@ from devito import (NODE, Eq, Inc, Constant, Function, TimeFunction,  # noqa
                     SparseTimeFunction, Dimension, SubDimension,
                     ConditionalDimension, DefaultDimension, Grid, Operator,
                     norm, grad, div, dimensions, switchconfig, configuration,
-                    first_derivative, solve, transpose, Abs, cos,
+                    first_derivative, solve, transpose, Abs, cos, exp,
                     sin, sqrt, floor, Ge, Lt, Derivative)
 from devito.exceptions import InvalidArgument, InvalidOperator
 from devito.ir import (Conditional, DummyEq, Expression, Iteration, FindNodes,
@@ -74,6 +74,7 @@ def test_scheduling_after_rewrite():
     ('sqrt(fa[x]**4)', 'sqrt(fa[x]*fa[x]*fa[x]*fa[x])'),
     ('sqrt(fa[x])**2', 'fa[x]'),
     ('fa[x]**-2', '1/(fa[x]*fa[x])'),
+    ('cos(fa[x]*fa[x])*cos(fa[x]*fa[x])', 'cos(fa[x]*fa[x])*cos(fa[x]*fa[x])'),
 ])
 def test_pow_to_mul(expr, expected):
     grid = Grid((4, 5))
@@ -87,7 +88,7 @@ def test_pow_to_mul(expr, expected):
 
 
 @pytest.mark.parametrize('expr,expected', [
-    ('s - SizeOf("int")*fa[x]', 's - fa[x]*sizeof(int)'),
+    ('s - SizeOf("int")*fa[x]', 's - sizeof(int)*fa[x]'),
     ('foo(4*fa[x] + 4*fb[x])', 'foo(4*(fa[x] + fb[x]))'),
     ('floor(0.1*a + 0.1*fa[x])', 'floor(0.1*(a + fa[x]))'),
     ('floor(0.1*(a + fa[x]))', 'floor(0.1*(a + fa[x]))'),
@@ -326,6 +327,23 @@ class TestLifting:
         assert len(trees) == 2
         assert_structure(op, ['t,x,y', 't'], 'txy')
         assert trees[1].dimensions == [time]
+
+    def test_scalar_cond(self):
+        grid = Grid(shape=(5, 5))
+        time = grid.time_dim
+        u = TimeFunction(name="u", grid=grid, time_order=1)
+        bt = ConditionalDimension(name="bt", parent=time, condition=Ge(time, 2))
+
+        W = (1 - exp(-(time - 5)/5))
+        eqns = [Eq(u.forward, 1),
+                Eq(u.forward, u.forward * (1 - W) + W * u, implicit_dims=bt)]
+        op = Operator(eqns)
+
+        trees = retrieve_iteration_tree(op)
+
+        assert len(trees) == 3
+        assert_structure(op, ['t', 't,x,y', 't,x,y'], 'txyxy')
+        assert trees[0].dimensions == [time]
 
 
 class TestAliases:
@@ -581,11 +599,11 @@ class TestAliases:
                                               'cire-rotate': rotate}))
 
         # Check code generation
-        bns, pbs = assert_blocking(op1, {'ix0_blk0'})
-        xs, ys, zs = get_params(op1, 'ix0_blk0_size', 'iy0_blk0_size', 'z_size')
-        arrays = [i for i in FindSymbols().visit(bns['ix0_blk0']) if i.is_Array]
+        bns, pbs = assert_blocking(op1, {'x0_blk0'})
+        xs, ys, zs = get_params(op1, 'x0_blk0_size', 'y0_blk0_size', 'z_size')
+        arrays = [i for i in FindSymbols().visit(bns['x0_blk0']) if i.is_Array]
         assert len(arrays) == 1
-        assert len(FindNodes(VExpanded).visit(pbs['ix0_blk0'])) == 1
+        assert len(FindNodes(VExpanded).visit(pbs['x0_blk0'])) == 1
         check_array(arrays[0], ((1, 1), (1, 1), (1, 1)), (xs+2, ys+2, zs+2), rotate)
 
         # Check numerical output
@@ -755,11 +773,11 @@ class TestAliases:
                                   'cire-mingain': 0, 'cire-rotate': rotate}))
 
         # Check code generation
-        bns, pbs = assert_blocking(op1, {'ix0_blk0'})
-        xs, ys, zs = get_params(op1, 'ix0_blk0_size', 'iy0_blk0_size', 'z_size')
-        arrays = [i for i in FindSymbols().visit(bns['ix0_blk0']) if i.is_Array]
+        bns, pbs = assert_blocking(op1, {'x0_blk0'})
+        xs, ys, zs = get_params(op1, 'x0_blk0_size', 'y0_blk0_size', 'z_size')
+        arrays = [i for i in FindSymbols().visit(bns['x0_blk0']) if i.is_Array]
         assert len(arrays) == 2
-        assert len(FindNodes(VExpanded).visit(pbs['ix0_blk0'])) == 2
+        assert len(FindNodes(VExpanded).visit(pbs['x0_blk0'])) == 2
         check_array(arrays[0], ((1, 0), (1, 0), (0, 0)), (xs+1, ys+1, zs), rotate)
         check_array(arrays[1], ((1, 1), (1, 0)), (ys+2, zs+1), rotate)
 
@@ -1077,7 +1095,7 @@ class TestAliases:
         arrays = [i for i in FindSymbols().visit(bns['x0_blk0']) if i.is_Array]
         assert len(arrays) == 6
         vexpandeds = FindNodes(VExpanded).visit(pbs['x0_blk0'])
-        assert len(vexpandeds) == (2 if configuration['language'] == 'openmp' else 0)
+        assert len(vexpandeds) == (2 if 'openmp' in configuration['language'] else 0)
         assert all(i._mem_heap and not i._mem_external for i in arrays)
         trees = retrieve_iteration_tree(bns['x0_blk0'])
         assert len(trees) == 2
@@ -1201,7 +1219,9 @@ class TestAliases:
         assert len(arrays) == 4
 
         exprs = FindNodes(Expression).visit(op)
-        sqrt_exprs = exprs[2:4]
+        if op._options['linearize']:
+            exprs = exprs[6:]
+        sqrt_exprs = exprs[:2]
         assert all(e.write in arrays for e in sqrt_exprs)
         assert all(e.expr.rhs.is_Pow for e in sqrt_exprs)
         assert all(e.write._mem_heap and not e.write._mem_external for e in sqrt_exprs)
@@ -2108,8 +2128,8 @@ class TestAliases:
 
             # Also check against expected operation count to make sure
             # all redundancies have been detected correctly
-            for i, exp in enumerate(as_tuple(exp_ops[n])):
-                assert summary[('section%d' % i, None)].ops == exp
+            for i, expected in enumerate(as_tuple(exp_ops[n])):
+                assert summary[('section%d' % i, None)].ops == expected
 
     def test_derivatives_from_different_levels(self):
         """
@@ -2296,12 +2316,14 @@ class TestAliases:
 
         op0 = Operator(eq, opt='noop')
         op1 = Operator(eq, opt=('advanced', {'blocklevels': 2, 'cire-rotate': rotate,
+                                             'linearize': False,
                                              'min-storage': True}))
         op2 = Operator(eq, opt=('advanced', {'blocklevels': 2, 'par-nested': 0,
+                                             'linearize': False,
                                              'cire-rotate': rotate, 'min-storage': True}))
 
         # Check code generation
-        if configuration['language'] == 'openmp':
+        if 'openmp' in configuration['language']:
             prefix = ['t']
         else:
             prefix = []
@@ -2323,7 +2345,7 @@ class TestAliases:
                 prefix + ['t,x0_blk0,y0_blk0,x0_blk1,y0_blk1,x,y,z']*3,
                 't,x0_blk0,y0_blk0,x0_blk1,y0_blk1,x,y,z,x,y,z,y,z'
             )
-        if configuration['language'] == 'openmp':
+        if 'openmp' in configuration['language']:
             bns, _ = assert_blocking(op2, {'x0_blk0'})
 
             pariters = FindNodes(ParallelIteration).visit(bns['x0_blk0'])
@@ -2364,7 +2386,8 @@ class TestAliases:
 
         op0 = Operator(eqn, opt=('noop', {'openmp': True}))
         op1 = Operator(eqn, opt=('advanced', {'openmp': True, 'cire-mingain': 0,
-                                              'cire-ftemps': True}))
+                                              'cire-ftemps': True,
+                                              'linearize': False}))
         op2 = Operator(eqn, opt=('advanced-fsg', {'openmp': True, 'cire-mingain': 0,
                                                   'cire-ftemps': True}))
 
@@ -2618,7 +2641,8 @@ class TestAliases:
         op = Operator(Eq(fo, f.dx))
         op.apply()
 
-        assert FindNodes(Expression).visit(op)[0].dtype == np.float32
+        k = 2 if op._options['linearize'] else 0
+        assert FindNodes(Expression).visit(op)[k].dtype == np.float32
         assert np.all(fo.data[:-1, :-1] == 8)
 
     def test_sparse_const(self):
@@ -2777,7 +2801,7 @@ class TestTTI:
         assert len(arrays) == 6
         assert all(not i._mem_external for i in arrays)
         assert len([i for i in arrays if i._mem_heap]) == 6
-        vexpanded = 2 if configuration['language'] == 'openmp' else 0
+        vexpanded = 2 if 'openmp' in configuration['language'] else 0
         assert len(FindNodes(VExpanded).visit(pbs['x0_blk0'])) == vexpanded
 
     @switchconfig(profiling='advanced')

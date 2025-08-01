@@ -5,7 +5,7 @@ on:
     types: [published]
   push:
     branches:
-      - master         # Push events on master branch
+      - main         # Push events on main branch
 
 jobs:
   deploy-devito:
@@ -14,32 +14,35 @@ jobs:
       # Use buildkit https://docs.docker.com/develop/develop-images/build_enhancements/ for better build
       DOCKER_BUILDKIT: "1"
 
+
     strategy:
       fail-fast: false
       matrix:
         include:
           - base: 'bases:nvidia-nvc'
             tag: 'nvidia-nvc'
-            flag: '--gpus all'
+            # Respect CUDA_VISIBLE_DEVICES set by the runner and hard-limit docker to that device.
+            # (--env without value forwards host var; --gpus maps only that device)
+            flag: --init --env CUDA_VISIBLE_DEVICES --gpus "device=${CUDA_VISIBLE_DEVICES:-all}"
             test: 'tests/test_gpu_openacc.py tests/test_gpu_common.py'
             runner: ["self-hosted", "nvidiagpu"]
 
           # Runtime gpu flags from https://hub.docker.com/r/rocm/tensorflow/
           - base: 'bases:amd'
             tag: 'amd'
-            flag: '--network=host --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --group-add $(getent group render | cut -d: -f3) --cap-add=SYS_PTRACE --security-opt seccomp=unconfined'
+            flag: '--init --network=host --device=/dev/kfd --device=/dev/dri --ipc=host --group-add video --group-add $(getent group render | cut -d: -f3) --cap-add=SYS_PTRACE --security-opt seccomp=unconfined'
             test: 'tests/test_gpu_openmp.py'
             runner: ["self-hosted", "amdgpu"]
 
           - base: 'bases:cpu-gcc'
             tag: "gcc"
-            flag: ''
+            flag: '--init -t'
             test: 'tests/test_operator.py'
             runner: ubuntu-latest
 
           - base: 'bases:cpu-icx'
             tag: "icx"
-            flag: ''
+            flag: '--init -t'
             test: 'tests/test_operator.py'
             runner: ubuntu-latest
 
@@ -47,24 +50,28 @@ jobs:
       - name: Checkout devito
         uses: actions/checkout@v4
 
+      - name: Set per‑runner variables
+        run: |
+          echo "CONTAINER_NAME=testrun-${{ matrix.tag }}-${RUNNER_NAME// /_}" >> $GITHUB_ENV
+
       - name: Check event name
         run: echo ${{ github.event_name }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           flavor: |
             latest=false
@@ -93,7 +100,7 @@ jobs:
         run: echo "${{ steps.meta.outputs.tags }}"
 
       - name: Build and push image
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/Dockerfile.devito
@@ -102,8 +109,11 @@ jobs:
           build-args: base=devitocodes/${{ matrix.base }}
 
       - name: Remove dangling layers
+        if: ${{ !contains(matrix.runner, 'nvidiagpu') }}
         run: docker system prune -f
 
       - name: Run tests
         run: |
-         docker run ${{ matrix.flag }} --rm -t --name testrun 'devitocodes/devito:${{ matrix.tag }}-dev' pytest ${{ matrix.test }}
+         docker run ${{ matrix.flag }} --rm -t --name "${CONTAINER_NAME}" \
+           devitocodes/devito:${{ matrix.tag }}-dev \
+           pytest ${{ matrix.test }}

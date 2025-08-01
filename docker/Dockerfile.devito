@@ -5,46 +5,58 @@
 # Base image with compilers
 ARG base=devitocodes/bases:cpu-gcc
 
-FROM $base as builder
+FROM $base AS builder
 
 # User/Group Ids
 ARG USER_ID=1000
 ARG GROUP_ID=1000
 
 ##################  Install devito ############################################
+
+ENV PIP_USE_PEP517=1
+# Install pip dependencies
+RUN python3 -m venv /venv && \
+    /venv/bin/pip install --no-cache-dir --upgrade pip wheel setuptools && \
+    /venv/bin/pip install --no-cache-dir jupyter && \
+    ln -fs /app/nvtop/build/src/nvtop /venv/bin/nvtop
+
 # Copy Devito
 ADD . /app/devito
-
-# Update if outdated
-RUN apt-get update
 
 # Remove git files
 RUN rm -rf /app/devito/.git
 
-# Install pip dependencies and devito as a pip package
-RUN python3 -m venv /venv && \
-    /venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /venv/bin/pip install --no-cache-dir jupyter && \
-    /venv/bin/pip install --no-cache-dir wheel && \
-    eval "$MPI4PY_FLAGS /venv/bin/pip install --no-cache-dir -r /app/devito/requirements-mpi.txt" && \
-    /venv/bin/pip install --no-cache-dir -e /app/devito[extras,tests] && \
-    rm -rf ~/.cache/pip
+# Mpi4py
+RUN eval "$MPI4PY_FLAGS /venv/bin/pip install --no-cache-dir --verbose -r /app/devito/requirements-mpi.txt"
 
-# Usefull utilities
+# Devito
+RUN /venv/bin/pip install --no-cache-dir -e /app/devito[extras,tests] && rm -rf ~/.cache/pip
+
+FROM $base AS utilities
+
+# tmpi
+RUN curl https://raw.githubusercontent.com/Azrael3000/tmpi/master/tmpi -o /usr/local/bin/tmpi
+
+# Update if outdated and install extras
+RUN apt-get update && apt-get install -y \
+    libncurses5-dev libncursesw5-dev libdrm-dev libsystemd-dev \
+    python3-dbg gdb numactl tmux vim
+
+# Install OpenGL library, necessary for the installation of GemPy
+RUN apt-get install -y libgl1-mesa-glx
+
 # Nvtop
-RUN apt-get install -y git cmake libncurses5-dev libncursesw5-dev libdrm-dev libsystemd-dev cmake && \
+RUN export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH && \
     git clone https://github.com/Syllo/nvtop.git /app/nvtop && \
     mkdir -p /app/nvtop/build && cd /app/nvtop/build && \
     cmake .. -DNVIDIA_SUPPORT=ON -DAMDGPU_SUPPORT=ON -DINTEL_SUPPORT=ON && \
-    make && \
-    make install && \
-    ln -fs /app/nvtop/build/src/nvtop /venv/bin/nvtop
+    make && make install
 
-# Safety cleanup
+# cleanup
 RUN apt-get clean && apt-get autoclean && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
-FROM $base as user
+FROM utilities AS user
 # COPY is much faster than RUN chown by order of magnitude so we have a final step that
 # just copies the built image into the user.
 
@@ -66,6 +78,7 @@ RUN groupadd -g ${GROUP_ID} app && \
     chown -R app:app $APP_HOME
 
 COPY --from=builder --chown=app:app /app /app
+COPY --from=utilities --chown=app:app /app/nvtop /app/nvtop
 
 ADD --chown=app:app docker/run-jupyter.sh /jupyter
 ADD --chown=app:app docker/run-tests.sh /tests

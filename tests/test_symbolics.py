@@ -4,19 +4,22 @@ import sympy
 import pytest
 import numpy as np
 
-from sympy import Expr, Symbol
+from sympy import Expr, Number, Symbol
 from devito import (Constant, Dimension, Grid, Function, solve, TimeFunction, Eq,  # noqa
                     Operator, SubDimension, norm, Le, Ge, Gt, Lt, Abs, sin, cos,
-                    Min, Max)
-from devito.ir import Expression, FindNodes
-from devito.symbolics import (retrieve_functions, retrieve_indexed, evalrel,  # noqa
-                              CallFromPointer, Cast, DefFunction, FieldFromPointer,
-                              INT, FieldFromComposite, IntDiv, Namespace, Rvalue,
-                              ReservedWord, ListInitializer, ccode, uxreplace,
-                              retrieve_derivatives)
-from devito.tools import as_tuple
+                    Min, Max, Real, Imag, Conj, SubDomain, configuration)
+from devito.finite_differences.differentiable import SafeInv, Weights, Mul
+from devito.ir import Expression, FindNodes, ccode
+from devito.mpi.halo_scheme import HaloTouch
+from devito.symbolics import (
+    retrieve_functions, retrieve_indexed, evalrel, CallFromPointer, Cast, # noqa
+    DefFunction, FieldFromPointer, INT, FieldFromComposite, IntDiv, Namespace,
+    Rvalue, ReservedWord, ListInitializer, uxreplace, pow_to_mul,
+    retrieve_derivatives, BaseCast, SizeOf, VectorAccess
+)
+from devito.tools import as_tuple, CustomDtype
 from devito.types import (Array, Bundle, FIndexed, LocalObject, Object,
-                          Symbol as dSymbol)
+                          ComponentAccess, StencilDimension, Symbol as dSymbol)
 from devito.types.basic import AbstractSymbol
 
 
@@ -64,7 +67,7 @@ def test_floatification_issue_1627(dtype, expected):
 
     eq = Eq(u.forward, ((u/x.spacing) + 2.0)/x.spacing)
 
-    op = Operator(eq)
+    op = Operator(eq, opt=('advanced', {'linearize': False}))
 
     exprs = FindNodes(Expression).visit(op)
     assert len(exprs) == 2
@@ -109,6 +112,19 @@ def test_modified_sympy_assumptions():
 
     assert s2.assumptions0 == s1.assumptions0
     assert s2 == s1
+
+
+def test_real():
+    for dtype in [np.float32, np.complex64]:
+        c = Constant(name='c', dtype=dtype)
+        assert c.is_real is not np.iscomplexobj(dtype(0))
+        assert c.is_imaginary is np.iscomplexobj(dtype(0))
+        f = Function(name='f', dtype=dtype, grid=Grid((11,)))
+        assert f.is_real is not np.iscomplexobj(dtype(0))
+        assert f.is_imaginary is np.iscomplexobj(dtype(0))
+        s = dSymbol(name='s', dtype=dtype)
+        assert s.is_real is not np.iscomplexobj(dtype(0))
+        assert s.is_imaginary is np.iscomplexobj(dtype(0))
 
 
 def test_constant():
@@ -345,6 +361,20 @@ def test_intdiv():
     assert ccode(v) == 'b*((a + b) / 2) + 3'
 
 
+def test_safeinv():
+    grid = Grid(shape=(11, 11))
+    x, y = grid.dimensions
+
+    u1 = Function(name='u', grid=grid)
+    u2 = Function(name='u', grid=grid, dtype=np.float64)
+
+    op1 = Operator(Eq(u1, SafeInv(u1, u1)))
+    op2 = Operator(Eq(u2, SafeInv(u2, u2)))
+
+    assert 'SAFEINV' in str(op1)
+    assert 'SAFEINV' in str(op2)
+
+
 def test_def_function():
     foo0 = DefFunction('foo', arguments=['a', 'b'], template=['int'])
     foo1 = DefFunction('foo', arguments=['a', 'b'], template=['int'])
@@ -391,11 +421,11 @@ def test_rvalue():
     assert str(Rvalue(ctype, ns, init)) == 'my::namespace::dummytype{}'
 
 
-def test_cast():
+def test_basecast():
     s = Symbol(name='s', dtype=np.float32)
 
-    class BarCast(Cast):
-        _base_typ = 'bar'
+    class BarCast(BaseCast):
+        _dtype = 'bar'
 
     v = BarCast(s, '**')
     assert ccode(v) == '(bar**)s'
@@ -405,6 +435,28 @@ def test_cast():
 
     v1 = BarCast(s, '****')
     assert v != v1
+
+
+def test_str_cast():
+    s = Symbol(name='s', dtype=np.float32)
+
+    v = Cast(s, 'foo')
+    assert not v.stars
+    assert v.dtype == 'foo'
+    assert v._op == '(foo)'
+    assert ccode(v) == '(foo)s'
+
+    v = Cast(s, 'foo*')
+    assert v.stars == '*'
+    assert v.dtype == 'foo'
+    assert v._op == '(foo*)'
+    assert ccode(v) == '(foo*)s'
+
+    v = Cast(s, 'foo **')
+    assert v.stars == '**'
+    assert v.dtype == 'foo'
+    assert v._op == '(foo**)'
+    assert ccode(v) == '(foo**)s'
 
 
 def test_findexed():
@@ -431,6 +483,83 @@ def test_findexed():
     assert new_fi.accessor.name == 'fL'
     assert new_fi.indices == fi.indices
     assert new_fi.strides_map == strides_map
+
+
+def test_component_access():
+    grid = Grid(shape=(3, 3, 3))
+    x, y, z = grid.dimensions
+
+    f = Function(name='f', grid=grid)
+
+    cf0 = ComponentAccess(f.indexify(), 0)
+    cf1 = ComponentAccess(f.indexify(), 1)
+
+    assert ccode(cf0) == 'f[x][y][z].x'
+    assert ccode(cf1) == 'f[x][y][z].y'
+
+    # Reconstruction
+    cf2 = cf1.func(*cf1.args)
+    assert cf2.index == cf1.index
+    assert cf2 == cf1
+
+
+def test_vector_access():
+    grid = Grid(shape=(3, 3, 3))
+
+    f = Function(name='f', grid=grid)
+    g = Function(name='g', grid=grid)
+
+    v = VectorAccess(f.indexify())
+
+    assert v.base == f.indexify()
+    assert v.function is f
+
+    # Code generation
+    assert ccode(v) == 'VL<f[x, y, z]>'
+
+    # Reconstruction
+    v1 = v.func(g.indexify())
+    assert ccode(v1) == 'VL<g[x, y, z]>'
+
+
+def test_halo_touch():
+    grid = Grid(shape=(3, 3))
+    x, y = grid.dimensions
+
+    f = Function(name='f', grid=grid)
+    g = Function(name='g', grid=grid)
+
+    # Hashing and equality
+    ht0 = HaloTouch(f[x, y], g[x, y])
+    ht1 = HaloTouch(f[x, y], g[x, y])
+    ht2 = HaloTouch(f[x, y], g[x + 1, y + 1])
+    assert hash(ht0) == hash(ht1)
+    assert ht0 == ht1
+    assert ht0 != ht2
+    assert hash(ht0) != hash(ht2)
+
+    # Reconstruction
+    assert ht0 == ht0._rebuild()
+    assert hash(ht0) == hash(ht0._rebuild())
+
+
+def test_canonical_ordering_of_weights():
+    grid = Grid(shape=(3, 3, 3))
+    x, y, z = grid.dimensions
+
+    f = Function(name='f', grid=grid)
+
+    i = StencilDimension('i0', 0, 2)
+    w = Weights(name='w0', dimensions=i, initvalue=[1.0, 2.0, 3.0])
+
+    fi = f[x, y + i, z]
+    wi = w[i]
+    cf = ComponentAccess(fi, 0)
+
+    assert (ccode(1.0*f[x, y, z] + 2.0*f[x, y + 1, z] + 3.0*f[x, y + 2, z]) ==
+            '1.0F*f[x][y][z] + 2.0F*f[x][y + 1][z] + 3.0F*f[x][y + 2][z]')
+    assert ccode(fi*wi) == 'w0[i0]*f[x][y + i0][z]'
+    assert ccode(cf*wi) == 'w0[i0]*f[x][y + i0][z].x'
 
 
 def test_symbolic_printing():
@@ -502,51 +631,79 @@ def test_solve_time():
     assert sympy.simplify(sympy.expand(sol - (-dt**2*u.dx/m + 2.0*u - u.backward))) == 0
 
 
-@pytest.mark.parametrize('expr,subs,expected', [
-    ('f', '{f: g}', 'g'),
-    ('f[x, y+1]', '{f.indexed: g.indexed}', 'g[x, y+1]'),
-    ('cos(f)', '{cos: sin}', 'sin(f)'),
-    ('cos(f + sin(g))', '{cos: sin, sin: cos}', 'sin(f + cos(g))'),
-    ('FIndexed(f.indexed, x, y)', '{x: 0}', 'FIndexed(f.indexed, 0, y)'),
-])
-def test_uxreplace(expr, subs, expected):
-    grid = Grid(shape=(4, 4))
-    x, y = grid.dimensions  # noqa
+class TestUxreplace:
 
-    f = Function(name='f', grid=grid)  # noqa
-    g = Function(name='g', grid=grid)  # noqa
+    @pytest.mark.parametrize('expr,subs,expected', [
+        ('f', '{f: g}', 'g'),
+        ('f[x, y+1]', '{f.indexed: g.indexed}', 'g[x, y+1]'),
+        ('cos(f)', '{cos: sin}', 'sin(f)'),
+        ('cos(f + sin(g))', '{cos: sin, sin: cos}', 'sin(f + cos(g))'),
+        ('FIndexed(f.indexed, x, y)', '{x: 0}', 'FIndexed(f.indexed, 0, y)'),
+    ])
+    def test_expressions(self, expr, subs, expected):
+        grid = Grid(shape=(4, 4))
+        x, y = grid.dimensions  # noqa
 
-    assert uxreplace(eval(expr), eval(subs)) == eval(expected)
+        f = Function(name='f', grid=grid)  # noqa
+        g = Function(name='g', grid=grid)  # noqa
 
+        assert uxreplace(eval(expr), eval(subs)) == eval(expected)
 
-def test_uxreplace_custom_reconstructable():
+    def test_custom_reconstructable(self):
 
-    class MyDefFunction(DefFunction):
-        __rargs__ = ('name', 'arguments')
-        __rkwargs__ = ('p0', 'p1', 'p2')
+        class MyDefFunction(DefFunction):
+            __rargs__ = ('name', 'arguments')
+            __rkwargs__ = ('p0', 'p1', 'p2')
 
-        def __new__(cls, name=None, arguments=None, p0=None, p1=None, p2=None):
-            obj = super().__new__(cls, name=name, arguments=arguments)
-            obj.p0 = p0
-            obj.p1 = as_tuple(p1)
-            obj.p2 = p2
-            return obj
+            def __new__(cls, name=None, arguments=None, p0=None, p1=None, p2=None):
+                obj = super().__new__(cls, name=name, arguments=arguments)
+                obj.p0 = p0
+                obj.p1 = as_tuple(p1)
+                obj.p2 = p2
+                return obj
 
-    grid = Grid(shape=(4, 4))
+        grid = Grid(shape=(4, 4))
 
-    f = Function(name='f', grid=grid)
-    g = Function(name='g', grid=grid)
+        f = Function(name='f', grid=grid)
+        g = Function(name='g', grid=grid)
 
-    func = MyDefFunction(name='foo', arguments=f.indexify(),
-                         p0=f, p1=f, p2='bar')
+        func = MyDefFunction(name='foo', arguments=f.indexify(),
+                             p0=f, p1=f, p2='bar')
 
-    mapper = {f: g, f.indexify(): g.indexify()}
-    func1 = uxreplace(func, mapper)
+        mapper = {f: g, f.indexify(): g.indexify()}
+        func1 = uxreplace(func, mapper)
 
-    assert func1.arguments == (g.indexify(),)
-    assert func1.p0 is g
-    assert func1.p1 == (g,)
-    assert func1.p2 == 'bar'
+        assert func1.arguments == (g.indexify(),)
+        assert func1.p0 is g
+        assert func1.p1 == (g,)
+        assert func1.p2 == 'bar'
+
+    def test_reduce_to_number(self):
+        grid = Grid(shape=(4, 4))
+        x, _ = grid.dimensions
+        h_x = x.spacing
+
+        # Emulate lowered coefficient
+        w = -0.0354212/(h_x*h_x)
+        w_lowered = pow_to_mul(w)
+
+        w_sub = uxreplace(w_lowered, {h_x: Number(3)})
+
+        assert np.isclose(w_sub, -0.003935689)
+        assert not w_sub.is_Mul
+        assert w_sub.is_Number
+
+    def test_halo_touch(self):
+        grid = Grid(shape=(3, 3))
+        x, y = grid.dimensions
+
+        f = Function(name='f', grid=grid)
+        g = Function(name='g', grid=grid)
+
+        ht0 = HaloTouch(f[x, y])
+        ht1 = uxreplace(ht0, {f.indexed: g.indexed})
+
+        assert ht1.args == (g[x, y],)
 
 
 def test_minmax():
@@ -585,6 +742,8 @@ def test_minmax_precision(dtype, expected):
 
     # Check generated code -- ensure it's using the fp64 versions of min/max,
     # that is fminf/fmaxf
+    if 'CXX' in configuration['language']:
+        expected = [f"std::{e.replace('f(', '(')}" for e in expected]
     assert all(i in str(op) for i in expected)
 
     assert np.all(f.data == 6.0)
@@ -608,8 +767,11 @@ def test_pow_precision(dtype, expected):
 
     op.apply()
 
+    if 'CXX' in configuration['language']:
+        expected = "std::pow"
+
     assert expected in str(op)
-    assert np.all(f.data == 8.0)
+    assert np.allclose(f.data, 8.0, rtol=np.finfo(dtype).eps)
 
 
 @pytest.mark.parametrize('dtype,expected', [
@@ -629,6 +791,9 @@ def test_abs_precision(dtype, expected):
     g.data[:] = -1.0
 
     op.apply()
+
+    if 'CXX' in configuration['language']:
+        expected = "std::fabs"
 
     assert expected in str(op)
     assert np.all(f.data == 1.0)
@@ -771,3 +936,175 @@ class TestRelationsWithAssumptions:
         assumptions = eval(assumptions)
         expected = eval(expected)
         assert evalrel(op, eqn, assumptions) == expected
+
+
+def test_issue_2577a():
+    u = TimeFunction(name='u', grid=Grid((2,)))
+    x = u.grid.dimensions[0]
+    expr = Mul(-1, -1., x, u)
+    assert expr.args == (x, u)
+    eq = Eq(u.forward, expr)
+    op = Operator(eq)
+
+    assert '--' not in str(op.ccode)
+
+
+def test_issue_2577b():
+    class SD0(SubDomain):
+        name = 'sd0'
+
+        def define(self, dimensions):
+            x, = dimensions
+            return {x: ('middle', 1, 1)}
+
+    grid = Grid(shape=(11,))
+
+    sd0 = SD0(grid=grid)
+
+    u = Function(name='u', grid=grid, space_order=2)
+
+    eq_u = Eq(u, -(u*u).dxc, subdomain=sd0)
+
+    op = Operator(eq_u)
+    assert '--' not in str(op.ccode)
+
+
+def test_print_div():
+    a = SizeOf(np.int32)
+    b = SizeOf(np.int64)
+    cstr = ccode(a / b)
+    assert cstr == 'sizeof(int)/sizeof(long)'
+
+
+def test_customdtype_complex():
+    """
+    Test that `CustomDtype` doesn't brak is_imag
+    """
+    grid = Grid(shape=(4, 4))
+
+    f = Function(name='f', grid=grid, dtype=CustomDtype('notnumpy'))
+
+    assert not f.is_imaginary
+    assert f.is_real
+
+
+class TestComplexParts:
+    def setup_basic(self, dtype):
+        grid = Grid(shape=(5,), extent=(4.,))
+        f = Function(name='f', grid=grid, dtype=dtype)
+        f.data_with_halo[:] = np.arange(7) + 1j*np.arange(7, 14)[::-1]
+
+        f_real = Function(name='f_real', grid=grid)
+        f_imag = Function(name='f_imag', grid=grid)
+        return f, f_real, f_imag
+
+    def test_devito_print(self):
+        f, _, _ = self.setup_basic(np.complex64)
+
+        assert str(Real(f)) == 'Real(f(x))'
+        assert str(Imag(f)) == 'Imag(f(x))'
+
+    def test_printing(self):
+        f, f_real, f_imag = self.setup_basic(np.complex64)
+
+        eq_re = Eq(f_real, Real(f))
+        eq_im = Eq(f_imag, Imag(f))
+
+        op = Operator([eq_re, eq_im])
+
+        if configuration['language'] in ('CXX', 'CXXopenmp'):
+            assert "f_real[x + 1] = std::real(f[x + 1])" in str(op.ccode)
+            assert "f_imag[x + 1] = std::imag(f[x + 1])" in str(op.ccode)
+
+        else:
+            assert "f_real[x + 1] = crealf(f[x + 1])" in str(op.ccode)
+            assert "f_imag[x + 1] = cimagf(f[x + 1])" in str(op.ccode)
+
+    @pytest.mark.parametrize('dtype', [np.complex64, np.complex128])
+    def test_trivial(self, dtype):
+        f, f_real, f_imag = self.setup_basic(dtype)
+
+        eq_re = Eq(f_real, Real(f+1.))
+        eq_im = Eq(f_imag, Imag(f+1.))
+
+        Operator([eq_re, eq_im])()
+
+        rcheck = np.array([2., 3., 4., 5., 6.])
+        icheck = np.array([12., 11., 10., 9., 8.])
+        assert np.all(np.isclose(f_real.data, rcheck))
+        assert np.all(np.isclose(f_imag.data, icheck))
+
+    @pytest.mark.parametrize('dtype', [np.complex64, np.complex128])
+    def test_trivial_imag(self, dtype):
+        f, f_real, f_imag = self.setup_basic(dtype)
+
+        eq_re = Eq(f_real, Real(f+1j))
+        eq_im = Eq(f_imag, Imag(f+1j))
+
+        Operator([eq_re, eq_im])()
+
+        rcheck = np.array([1., 2., 3., 4., 5.])
+        icheck = np.array([13., 12., 11., 10., 9.])
+        assert np.all(np.isclose(f_real.data, rcheck))
+        assert np.all(np.isclose(f_imag.data, icheck))
+
+    def test_deriv(self):
+        f, f_real, f_imag = self.setup_basic(np.complex64)
+
+        eq_re = Eq(f_real, Real(f.dx))
+        eq_im = Eq(f_imag, Imag(f.dx))
+
+        Operator([eq_re, eq_im])()
+
+        assert np.all(np.isclose(f_real.data, 1.))
+        assert np.all(np.isclose(f_imag.data, -1.))
+
+    def test_outer_deriv(self):
+        f, f_real, f_imag = self.setup_basic(np.complex64)
+
+        eq_re = Eq(f_real, Real(f).dx)
+        eq_im = Eq(f_imag, Imag(f).dx)
+
+        Operator([eq_re, eq_im])()
+
+        assert np.all(np.isclose(f_real.data, 1.))
+        assert np.all(np.isclose(f_imag.data, -1.))
+
+    def test_mul(self):
+        grid = Grid(shape=(5,))
+
+        f = Function(name='f', grid=grid, dtype=np.complex64)
+        g = Function(name='g', grid=grid)
+        h = Function(name='h', grid=grid, dtype=np.complex64)
+        f.data[:] = 1 + 1j
+        g.data[:] = 2
+        h.data[:] = 2j
+
+        fg_re = Function(name='fg_re', grid=grid)
+        fg_im = Function(name='fg_im', grid=grid)
+        fh_re = Function(name='fh_re', grid=grid)
+        fh_im = Function(name='fh_im', grid=grid)
+
+        eq_fg_re = Eq(fg_re, Real(f*g))
+        eq_fg_im = Eq(fg_im, Imag(f*g))
+        eq_fh_re = Eq(fh_re, Real(f*h))
+        eq_fh_im = Eq(fh_im, Imag(f*h))
+
+        Operator([eq_fg_re, eq_fg_im, eq_fh_re, eq_fh_im])()
+
+        assert np.all(np.isclose(fg_re.data, 2.))
+        assert np.all(np.isclose(fg_im.data, 2.))
+
+        assert np.all(np.isclose(fh_re.data, -2.))
+        assert np.all(np.isclose(fh_im.data, 2.))
+
+    def test_conj(self):
+        grid = Grid(shape=(5,))
+        f = Function(name='f', grid=grid, dtype=np.complex64)
+        g = Function(name='g', grid=grid, dtype=np.complex64)
+
+        f.data[:] = np.arange(5) + 1j*np.arange(5)[::-1]
+
+        Operator([Eq(g, Conj(f))])()
+
+        assert np.all(np.isclose(g.data, np.conj(f.data)))

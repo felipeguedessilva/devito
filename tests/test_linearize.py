@@ -3,7 +3,7 @@ import numpy as np
 import scipy.sparse
 
 from devito import (Grid, Function, TimeFunction, SparseTimeFunction, Operator, Eq,
-                    Inc, MatrixSparseTimeFunction, sin, switchconfig)
+                    Inc, MatrixSparseTimeFunction, sin, switchconfig, configuration)
 from devito.ir import Call, Callable, DummyExpr, Expression, FindNodes, SymbolRegistry
 from devito.passes import Graph, linearize, generate_macros
 from devito.types import Array, Bundle, DefaultDimension
@@ -17,7 +17,7 @@ def test_basic():
 
     eqn = Eq(u.forward, u + 1)
 
-    op0 = Operator(eqn)
+    op0 = Operator(eqn, opt=('advanced', {'linearize': False}))
     op1 = Operator(eqn, opt=('advanced', {'linearize': True}))
 
     # Check generated code
@@ -39,7 +39,7 @@ def test_mpi(mode):
 
     eqn = Eq(u.forward, u.dx2 + 1.)
 
-    op0 = Operator(eqn)
+    op0 = Operator(eqn, opt=('advanced', {'linearize': False}))
     op1 = Operator(eqn, opt=('advanced', {'linearize': True}))
 
     # Check generated code
@@ -60,7 +60,7 @@ def test_cire():
 
     eqn = Eq(u.forward, u.dy.dy + 1.)
 
-    op0 = Operator(eqn, opt=('advanced', {'cire-mingain': 0}))
+    op0 = Operator(eqn, opt=('advanced', {'linearize': False, 'cire-mingain': 0}))
     op1 = Operator(eqn, opt=('advanced', {'linearize': True, 'cire-mingain': 0}))
 
     # Check generated code
@@ -85,7 +85,7 @@ def test_nested_indexeds():
 
     eqn = Eq(u.forward, u[t, f[g[x], g[x]], y] + 1.)
 
-    op0 = Operator(eqn)
+    op0 = Operator(eqn, opt=('advanced', {'linearize': False}))
     op1 = Operator(eqn, opt=('advanced', {'linearize': True}))
 
     # Check generated code
@@ -113,7 +113,7 @@ def test_interpolation():
             src.inject(field=u.forward, expr=src) +
             rec.interpolate(expr=u.forward))
 
-    op0 = Operator(eqns, opt='advanced')
+    op0 = Operator(eqns, opt=('advanced', {'linearize': False}))
     op1 = Operator(eqns, opt=('advanced', {'linearize': True}))
 
     # Check generated code
@@ -162,7 +162,7 @@ def test_interpolation_msf():
     eqns = sf.inject(field=m0.forward, expr=sf.dt2)
     eqns += sf.inject(field=m1.forward, expr=sf.dt2)
 
-    op0 = Operator(eqns)
+    op0 = Operator(eqns, opt=('advanced', {'linearize': False}))
     op1 = Operator(eqns, opt=('advanced', {'linearize': True}))
 
     assert 'm0L0' in str(op1)
@@ -190,7 +190,7 @@ def test_codegen_quality0(mode):
     # Only four access macros necessary, namely `uL0`, `bufL0`, `bufL1`
     # for the efunc args
     # (the other three obviously are _POSIX_C_SOURCE, START, STOP)
-    assert len(op._headers) == 6
+    assert len(op.headers) == 6
 
 
 def test_codegen_quality1():
@@ -212,7 +212,7 @@ def test_codegen_quality1():
 
     # Only two access macros necessary, namely `uL0` and `r1L0` (the other five
     # obviously are _POSIX_C_SOURCE, MIN, MAX, START, STOP)
-    assert len(op._headers) == 6
+    assert len(op.headers) == 6
 
 
 def test_pow():
@@ -246,7 +246,7 @@ def test_different_halos():
 
     eqn = Eq(u.forward, u + f + g + 1)
 
-    op0 = Operator(eqn)
+    op0 = Operator(eqn, opt=('advanced', {'linearize': False}))
     op1 = Operator(eqn, opt=('advanced', {'linearize': True}))
 
     # Check generated code
@@ -283,7 +283,7 @@ def test_unsubstituted_indexeds():
 
     eq = Eq(p.forward, sin(f)*p*f)
 
-    op0 = Operator(eq)
+    op0 = Operator(eq, opt=('advanced', {'linearize': False}))
     op1 = Operator(eq, opt=('advanced', {'linearize': True}))
 
     # NOTE: Eventually we compare the numerical output, but truly the most
@@ -342,20 +342,21 @@ def test_strides_forwarding1():
     linearize(graph, callback=True, options={'index-mode': 'int32'},
               sregistry=SymbolRegistry())
 
-    # Despite `a` is passed via `a.indexed`, and since it's an Array (which
-    # have symbolic shape), we expect the stride exprs to be placed in `bar`,
-    # and in `bar` only, as `foo` doesn't really use `a`, it just propagates it
-    # down to `bar`
+    # `a` is passed via `a.indexed`, so the stride exprs are expected to be
+    # placed in `foo` and then passed down to `bar` as arguments
     foo = graph.root
     bar = graph.efuncs['bar']
 
     assert len(foo.body.body) == 1
     assert foo.body.body[0].is_Call
+    assert len(foo.body.strides) == 3
+    assert foo.body.strides[0].write.name == 'y_fsz0'
+    assert foo.body.strides[2].write.name == 'y_stride0'
 
+    assert len(bar.parameters) == 2
+    assert bar.parameters[0].name == 'a'
+    assert bar.parameters[1].name == 'y_stride0'
     assert len(bar.body.body) == 1
-    assert len(bar.body.strides) == 3
-    assert bar.body.strides[0].write.name == 'y_fsz0'
-    assert bar.body.strides[2].write.name == 'y_stride0'
 
 
 def test_strides_forwarding2():
@@ -491,7 +492,7 @@ def test_issue_1838():
 
     eq = Eq(p0.forward, (sin(b)*p0.dx).dx + (sin(b)*p0.dx).dy + (sin(b)*p0.dx).dz + p0)
 
-    op0 = Operator(eq)
+    op0 = Operator(eq, opt=('advanced', {'linearize': False}))
     op1 = Operator(eq, opt=('advanced', {'linearize': True}))
 
     op0.apply(time_M=3, dt=1.)
@@ -639,3 +640,22 @@ def test_different_dtype(autopadding):
         assert "L0(x,y) f[(x)*y_stride0 + (y)]" in str(op1)
 
     _test_different_dtype()
+
+
+@pytest.mark.parametrize('order', [2, 4])
+def test_int64_array(order):
+
+    grid = Grid(shape=(4, 4))
+    f = Function(name='f', grid=grid, space_order=order)
+
+    a = Array(name='a', dimensions=grid.dimensions, shape=grid.shape,
+              halo=f.halo)
+
+    eqs = [Eq(f, a.indexify() + 1)]
+    op = Operator(eqs, opt=('advanced', {'linearize': True, 'index-mode': 'int64'}))
+    if 'CXX' in configuration['language']:
+        long = 'static_cast<long>'
+        assert f'({2*order} + {long}(y_size))*({2*order} + {long}(x_size)))' in str(op)
+    else:
+        long = '(long)'
+        assert f'({2*order} + {long}y_size)*({2*order} + {long}x_size))' in str(op)

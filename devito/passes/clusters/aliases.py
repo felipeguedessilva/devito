@@ -109,11 +109,11 @@ class CireTransformer:
     def __init__(self, sregistry, options, platform):
         self.sregistry = sregistry
         self.platform = platform
-
         self.opt_minstorage = options['min-storage']
         self.opt_rotate = options['cire-rotate']
         self.opt_ftemps = options['cire-ftemps']
         self.opt_mingain = options['cire-mingain']
+        self.opt_min_dtype = options['scalar-min-type']
         self.opt_multisubdomain = True
 
     def _aliases_from_clusters(self, clusters, exclude, meta):
@@ -143,7 +143,7 @@ class CireTransformer:
 
         # Schedule -> [Clusters]_k
         processed, subs = lower_schedule(schedule, meta, self.sregistry,
-                                         self.opt_ftemps)
+                                         self.opt_ftemps, self.opt_min_dtype)
 
         # [Clusters]_k -> [Clusters]_k (optimization)
         if self.opt_multisubdomain:
@@ -261,9 +261,10 @@ class CireInvariants(CireTransformerLegacy, Queue):
             made = self._aliases_from_clusters(g, exclude, ak)
 
             if made:
+                idx = processed.index(g[0])
                 for n, c in enumerate(g, -len(g)):
                     processed[processed.index(c)] = made.pop(n)
-                processed = made + processed
+                processed[idx:idx] = made
 
                 xtracted.extend(made)
 
@@ -830,7 +831,7 @@ def optimize_schedule_rotations(schedule, sregistry):
     return schedule.rebuild(*processed, rmapper=rmapper)
 
 
-def lower_schedule(schedule, meta, sregistry, ftemps):
+def lower_schedule(schedule, meta, sregistry, ftemps, min_dtype):
     """
     Turn a Schedule into a sequence of Clusters.
     """
@@ -848,7 +849,6 @@ def lower_schedule(schedule, meta, sregistry, ftemps):
         # This prevents cases such as `floor(a*b)` with `a` and `b` floats
         # that would creat a temporary `int r = b` leading to erronous
         # numerical results
-        dtype = sympy_dtype(pivot, base=meta.dtype)
 
         if writeto:
             # The Dimensions defining the shape of Array
@@ -880,6 +880,7 @@ def lower_schedule(schedule, meta, sregistry, ftemps):
                     # E.g., `z` -- a non-shifted Dimension
                     indices.append(i.dim - i.lower)
 
+            dtype = sympy_dtype(pivot, base=meta.dtype)
             obj = make(name=name, dimensions=dimensions, halo=halo, dtype=dtype)
             expression = Eq(obj[indices], uxreplace(pivot, subs))
 
@@ -888,6 +889,7 @@ def lower_schedule(schedule, meta, sregistry, ftemps):
             # Degenerate case: scalar expression
             assert writeto.size == 0
 
+            dtype = sympy_dtype(pivot, base=meta.dtype, smin=min_dtype)
             obj = Temp(name=name, dtype=dtype)
             expression = Eq(obj, uxreplace(pivot, subs))
 
@@ -1352,7 +1354,7 @@ class Schedule(tuple):
         # Not just the sum for the individual items' cost! There might be
         # redundancies, which we factor out here...
         counter = generator()
-        make = lambda: Symbol(name='dummy%d' % counter(), dtype=np.float32)
+        make = lambda _: Symbol(name='dummy%d' % counter(), dtype=np.float32)
 
         tot = 0
         for v in as_mapper(self, lambda i: i.ispace).values():

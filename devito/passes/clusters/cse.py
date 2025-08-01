@@ -1,6 +1,7 @@
-from collections import defaultdict
+from collections import defaultdict, Counter
 from functools import cached_property, singledispatch
 
+import numpy as np
 import sympy
 from sympy import Add, Function, Indexed, Mul, Pow
 try:
@@ -12,8 +13,9 @@ except ImportError:
 from devito.finite_differences.differentiable import IndexDerivative
 from devito.ir import Cluster, Scope, cluster_pass
 from devito.symbolics import estimate_cost, q_leaf, q_terminal
+from devito.symbolics.search import search
 from devito.symbolics.manipulation import _uxreplace
-from devito.tools import DAG, as_list, as_tuple, frozendict
+from devito.tools import DAG, as_list, as_tuple, frozendict, extract_dtype
 from devito.types import Eq, Symbol, Temp
 
 __all__ = ['cse']
@@ -24,7 +26,13 @@ class CTemp(Temp):
     """
     A cluster-level Temp, similar to Temp, ensured to have different priority
     """
+
     ordering_of_classes.insert(ordering_of_classes.index('Temp') + 1, 'CTemp')
+
+
+def retrieve_ctemps(exprs, mode='all'):
+    """Shorthand to retrieve the CTemps in `exprs`"""
+    return search(exprs, lambda expr: isinstance(expr, CTemp), mode, 'dfs')
 
 
 @cluster_pass
@@ -69,8 +77,16 @@ def cse(cluster, sregistry=None, options=None, **kwargs):
     """
     min_cost = options['cse-min-cost']
     mode = options['cse-algo']
+    try:
+        dtype = np.promote_types(options['scalar-min-type'], cluster.dtype).type
+    except TypeError:
+        dtype = cluster.dtype
 
-    make = lambda: CTemp(name=sregistry.make_name(), dtype=cluster.dtype)
+    if cluster.is_fence:
+        return cluster
+
+    make_dtype = lambda e: np.promote_types(e.dtype, dtype).type
+    make = lambda e: CTemp(name=sregistry.make_name(), dtype=make_dtype(e))
 
     exprs = _cse(cluster, make, min_cost=min_cost, mode=mode)
 
@@ -110,7 +126,7 @@ def _cse(maybe_exprs, make, min_cost=1, mode='basic'):
             exprs = maybe_exprs
             scope = Scope(maybe_exprs)
         else:
-            exprs = [Eq(make(), e) for e in maybe_exprs]
+            exprs = [Eq(make(e), e) for e in maybe_exprs]
             scope = Scope([])
 
     # Some sub-expressions aren't really "common" -- that's the case of Dimension-
@@ -147,7 +163,7 @@ def _cse(maybe_exprs, make, min_cost=1, mode='basic'):
         candidates = [c for c in candidates if c.cost == cost]
 
         # Apply replacements
-        chosen = [(c, scheduled.get(c.key) or make()) for c in candidates]
+        chosen = [(c, scheduled.get(c.key) or make(c)) for c in candidates]
         exprs = _inject(exprs, chosen, scheduled)
 
     # Drop useless temporaries (e.g., r0=r1)
@@ -216,8 +232,15 @@ def _compact(exprs, exclude):
 
     mapper = {e.lhs: e.rhs for e in candidates if q_leaf(e.rhs)}
 
-    mapper.update({e.lhs: e.rhs for e in candidates
-                   if sum([i.rhs.count(e.lhs) for i in exprs]) == 1})
+    # Find all the CTemps in expression right-hand-sides without removing duplicates
+    ctemps = retrieve_ctemps(e.rhs for e in exprs)
+
+    # If there are ctemps in the expressions, then add any that only appear once to
+    # the mapper
+    if ctemps:
+        ctemp_count = Counter(ctemps)
+        mapper.update({e.lhs: e.rhs for e in candidates
+                       if ctemp_count[e.lhs] == 1})
 
     processed = []
     for e in exprs:
@@ -235,6 +258,10 @@ def _toposort(exprs):
     """
     Ensure the expression list is topologically sorted.
     """
+    if not any(isinstance(e.lhs, CTemp) for e in exprs):
+        # No CSE temps, no need to topological sort
+        return exprs
+
     dag = DAG(exprs)
 
     for e0 in exprs:
@@ -246,9 +273,14 @@ def _toposort(exprs):
                 dag.add_edge(e0, e1, force_add=True)
 
     def choose_element(queue, scheduled):
-        # Try to honor temporary names as much as possible
-        first = sorted(queue, key=lambda i: str(i.lhs)).pop(0)
-        queue.remove(first)
+        tmps = [i for i in queue if isinstance(i.lhs, CTemp)]
+        if tmps:
+            # Try to honor temporary names as much as possible
+            first = sorted(tmps, key=lambda i: i.lhs.name).pop(0)
+            queue.remove(first)
+        else:
+            first = sorted(queue, key=lambda i: exprs.index(i)).pop(0)
+            queue.remove(first)
         return first
 
     processed = dag.topological_sort(choose_element)
@@ -266,6 +298,10 @@ class Candidate(tuple):
     @property
     def expr(self):
         return self[0]
+
+    @property
+    def dtype(self):
+        return extract_dtype(self.expr)
 
     @property
     def conditionals(self):

@@ -7,27 +7,45 @@ concurrency:
 on:
   push:
     paths:
-      - '/docker/Dockerfile.nvidia'
-      - '/docker/Dockerfile.cpu'
-      - '/docker/Dockerfile.amd'
-      - '/docker/Dockerfile.intel'
+      - "/docker/Dockerfile.nvidia"
+      - "/docker/Dockerfile.cpu"
+      - "/docker/Dockerfile.amd"
+      - "/docker/Dockerfile.intel"
   workflow_dispatch:
     inputs:
+      cpu:
+        type: boolean
+        default: false
+      nvidia:
+        type: boolean
+        default: false
+      amd:
+        type: boolean
+        default: false
+      intel:
+        type: boolean
+        default: false
+
       tags:
-        description: 'Build compiler bases'
+        description: "Build compiler bases"
   schedule:
-    # Run once a week
-    - cron: "0 13 * * 1"
+    # Run once a month
+    - cron: "0 0 1 * *"
 
 jobs:
-#######################################################
-############## Basic gcc CPU ##########################
-#######################################################
+  #######################################################
+  ############## Basic gcc CPU ##########################
+  #######################################################
   deploy-cpu-bases:
+    if: inputs.cpu
     name: "cpu-base"
     runs-on: ubuntu-latest
     env:
       DOCKER_BUILDKIT: "1"
+
+    strategy:
+      matrix:
+        gcc: ["", "14"]
 
     steps:
       - name: Checkout devito
@@ -37,35 +55,31 @@ jobs:
         run: echo ${{ github.event_name }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: cleanup
-        run: docker system prune -a -f
-
       - name: GCC image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.cpu'
+          file: "./docker/Dockerfile.cpu"
           push: true
-          target: 'gcc'
-          build-args: 'arch=gcc'
-          tags: 'devitocodes/bases:cpu-gcc'
+          build-args: "gcc=${{ matrix.gcc }}"
+          tags: "devitocodes/bases:cpu-gcc${{ matrix.gcc }}"
 
-
-#######################################################
-############## Intel OneApi CPU #######################
-#######################################################
+  #######################################################
+  ############## Intel OneApi CPU #######################
+  #######################################################
   deploy-oneapi-bases:
+    if: inputs.intel
     name: "oneapi-base"
     runs-on: ubuntu-latest
     env:
@@ -79,54 +93,51 @@ jobs:
         run: echo ${{ github.event_name }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: cleanup
-        run: docker system prune -a -f
-
       - name: ICX image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.intel'
+          file: "./docker/Dockerfile.intel"
           push: true
-          target: 'icx'
-          build-args: 'arch=icx'
-          tags: 'devitocodes/bases:cpu-icx'
+          target: "icx"
+          build-args: "arch=icx"
+          tags: "devitocodes/bases:cpu-icx"
 
       - name: SYCL CPU image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.intel'
+          file: "./docker/Dockerfile.intel"
           push: true
-          target: 'cpu-sycl'
-          build-args: 'arch=cpu-sycl'
-          tags: 'devitocodes/bases:cpu-sycl'
+          target: "cpu-sycl"
+          build-args: "arch=cpu-sycl"
+          tags: "devitocodes/bases:cpu-sycl"
 
       - name: SYCL GPU image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.intel'
+          file: "./docker/Dockerfile.intel"
           push: true
-          target: 'gpu-sycl'
-          build-args: 'arch=gpu-sycl'
-          tags: 'devitocodes/bases:gpu-sycl'
+          target: "gpu-sycl"
+          build-args: "arch=gpu-sycl"
+          tags: "devitocodes/bases:gpu-sycl"
 
-#######################################################
-################### Nvidia nvhpc ######################
-#######################################################
+  #######################################################
+  ################### Nvidia nvhpc ######################
+  #######################################################
   deploy-nvidia-bases:
+    if: inputs.nvidia
     name: "nvidia-bases"
     runs-on: ["self-hosted", "nvidiagpu"]
     env:
@@ -140,54 +151,56 @@ jobs:
         run: echo ${{ github.event_name }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: cleanup
-        run: docker system prune -a -f
-
       - name: NVC image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.nvidia'
+          file: "./docker/Dockerfile.nvidia"
           push: true
-          target: 'nvc'
-          build-args: 'arch=nvc'
-          tags: 'devitocodes/bases:nvidia-nvc'
+          target: "nvc"
+          build-args: "arch=nvc"
+          # Label (not tag) with runner name for traceability without changing image tags
+          labels: builder-runner=${{ runner.name }}
+          tags: "devitocodes/bases:nvidia-nvc"
 
       - name: NVCC image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.nvidia'
+          file: "./docker/Dockerfile.nvidia"
           push: true
-          target: 'nvcc'
-          build-args: 'arch=nvcc'
-          tags: 'devitocodes/bases:nvidia-nvcc'
+          target: "nvcc"
+          build-args: "arch=nvcc"
+          labels: builder-runner=${{ runner.name }}
+          tags: "devitocodes/bases:nvidia-nvcc"
 
       - name: NVC host image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.nvidia'
+          file: "./docker/Dockerfile.nvidia"
           push: true
-          target: 'nvc-host'
-          build-args: 'arch=nvc-host'
-          tags: 'devitocodes/bases:cpu-nvc'
+          target: "nvc-host"
+          build-args: "arch=nvc-host"
+          labels: builder-runner=${{ runner.name }}
+          tags: "devitocodes/bases:cpu-nvc"
 
-#######################################################
-##################### AMD #############################
-#######################################################
+  #######################################################
+  ##################### AMD #############################
+  #######################################################
   deploy-amd-bases:
+    if: inputs.amd
     name: "amd-base"
     runs-on: ["self-hosted", "amdgpu"]
     env:
@@ -201,36 +214,37 @@ jobs:
         run: echo ${{ github.event_name }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: cleanup
-        run: docker system prune -a -f
-
       - name: AMD image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.amd'
+          file: "./docker/Dockerfile.amd"
           push: true
-          target: 'amdclang'
+          target: "amdclang"
+          build-args: |
+            ROCM_VERSION=5.5.1
+            UCX_BRANCH=v1.13.1
+            OMPI_BRANCH=v4.1.4
           tags: devitocodes/bases:amd
 
       - name: AMD HIP image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: './docker/Dockerfile.amd'
+          file: "./docker/Dockerfile.amd"
           push: true
-          target: 'hip'
+          target: "hip"
           build-args: |
-            arch=hip
+            ROCM_VERSION=6.3.4
           tags: devitocodes/bases:amd-hip

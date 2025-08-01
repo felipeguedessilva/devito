@@ -13,25 +13,28 @@ from devito.arch import ANYCPU, Device, compiler_registry, platform_registry
 from devito.data import default_allocator
 from devito.exceptions import (CompilationError, ExecutionError, InvalidArgument,
                                InvalidOperator)
-from devito.logger import debug, info, perf, warning, is_log_enabled_for, switch_log_level
+from devito.logger import (debug, info, perf, warning, is_log_enabled_for,
+                           switch_log_level)
 from devito.ir.equations import LoweredEq, lower_exprs, concretize_subdims
 from devito.ir.clusters import ClusterGroup, clusterize
-from devito.ir.iet import (Callable, CInterface, EntryFunction, FindSymbols, MetaCall,
-                           derive_parameters, iet_build)
+from devito.ir.iet import (Callable, CInterface, EntryFunction, FindSymbols,
+                           MetaCall, derive_parameters, iet_build)
 from devito.ir.support import AccessMode, SymbolRegistry
 from devito.ir.stree import stree_build
 from devito.operator.profiling import create_profile
 from devito.operator.registry import operator_selector
 from devito.mpi import MPI
 from devito.parameters import configuration
-from devito.passes import (Graph, lower_index_derivatives, generate_implicit,
-                           generate_macros, minimize_symbols, unevaluate,
-                           error_mapper, is_on_device)
+from devito.passes import (
+    Graph, lower_index_derivatives, generate_implicit, generate_macros,
+    minimize_symbols, unevaluate, error_mapper, is_on_device, lower_dtypes
+)
 from devito.symbolics import estimate_cost, subs_op_args
 from devito.tools import (DAG, OrderedSet, Signer, ReducerMap, as_mapper, as_tuple,
                           flatten, filter_sorted, frozendict, is_integer,
-                          split, timed_pass, timed_region, contains_val)
-from devito.types import (Buffer, Grid, Evaluable, host_layer, device_layer,
+                          split, timed_pass, timed_region, contains_val,
+                          CacheInstances)
+from devito.types import (Buffer, Evaluable, host_layer, device_layer,
                           disk_layer)
 from devito.types.dimension import Thickness
 
@@ -143,11 +146,6 @@ class Operator(Callable):
     refer to the relevant documentation.
     """
 
-    _default_headers = [('_POSIX_C_SOURCE', '200809L')]
-    _default_includes = ['stdlib.h', 'math.h', 'sys/time.h']
-    _default_globals = []
-    _default_namespaces = []
-
     def __new__(cls, expressions, **kwargs):
         if expressions is None:
             # Return a dummy Callable. This is exploited by unpickling. Users
@@ -207,18 +205,20 @@ class Operator(Callable):
         Callable.__init__(op, **op.args)
 
         # Header files, etc.
-        op._headers = OrderedSet(*cls._default_headers)
-        op._headers.update(byproduct.headers)
-        op._globals = OrderedSet(*cls._default_globals)
-        op._globals.update(byproduct.globals)
-        op._includes = OrderedSet(*cls._default_includes)
-        op._includes.update(profiler._default_includes)
+        op._headers = OrderedSet(*byproduct.headers)
+        op._globals = OrderedSet(*byproduct.globals)
+        op._includes = OrderedSet(*profiler._default_includes)
         op._includes.update(byproduct.includes)
-        op._namespaces = OrderedSet(*cls._default_namespaces)
-        op._namespaces.update(byproduct.namespaces)
+        op._namespaces = OrderedSet(*byproduct.namespaces)
 
         # Required for the jit-compilation
         op._compiler = kwargs['compiler']
+
+        # Required for compilation by the profiler
+        op._compiler.add_include_dirs(profiler._include_dirs)
+        op._compiler.add_library_dirs(profiler._lib_dirs, rpath=True)
+        op._compiler.add_libraries(profiler._default_libs)
+
         op._language = kwargs['language']
         op._lib = None
         op._cfunction = None
@@ -247,6 +247,9 @@ class Operator(Callable):
         op._dtype, op._dspace = irs.clusters.meta
         op._profiler = profiler
 
+        # Clear build-scoped instance caches
+        CacheInstances.clear_caches()
+
         return op
 
     def __init__(self, *args, **kwargs):
@@ -262,6 +265,9 @@ class Operator(Callable):
         """
         # Create a symbol registry
         kwargs.setdefault('sregistry', SymbolRegistry())
+        # Add lang-base kwargs
+        kwargs.setdefault('langbb', cls._Target.langbb())
+        kwargs.setdefault('printer', cls._Target.Printer)
 
         expressions = as_tuple(expressions)
 
@@ -487,6 +493,9 @@ class Operator(Callable):
         # Extract the necessary macros from the symbolic objects
         generate_macros(graph, **kwargs)
 
+        # Target-specific lowering
+        lower_dtypes(graph, **kwargs)
+
         # Target-independent optimizations
         minimize_symbols(graph)
 
@@ -556,12 +565,34 @@ class Operator(Callable):
                 if k not in self._known_arguments:
                     raise InvalidArgument(f"Unrecognized argument `{k}={v}`")
 
+        overrides, defaults = split(self.input, lambda p: p.name in kwargs)
+
+        # DiscreteFunctions may be created from CartesianDiscretizations, which in
+        # turn could be Grids or SubDomains. Both may provide arguments
+        discretizations = {getattr(kwargs.get(p.name, p), 'grid', None)
+                           for p in self.input} - {None}
+
+        # There can only be one Grid from which DiscreteFunctions were created
+        grids = {i.root for i in discretizations}
+
+        if len(grids) > 1 and configuration['mpi']:
+            # We loosely tolerate multiple Grids for backwards compatibility
+            # with spatial subsampling, which should be revisited however. And
+            # With MPI it would definitely break!
+            raise ValueError("Multiple Grids found")
+
+        nodes = set(self.dimensions)
+        if grids:
+            grid = grids.pop()
+            nodes.update(grid.dimensions)
+        else:
+            grid = None
+
         # Pre-process Dimension overrides. This may help ruling out ambiguities
         # when processing the `defaults` arguments. A topological sorting is used
         # as DerivedDimensions may depend on their parents
-        nodes = self.dimensions
-        edges = [(i, i.parent) for i in self.dimensions
-                 if i.is_Derived and i.parent in set(nodes)]
+        edges = [(i, i.parent) for i in nodes
+                 if i.is_Derived and i.parent in nodes]
         toposort = DAG(nodes, edges).topological_sort()
 
         futures = {}
@@ -615,31 +646,8 @@ class Operator(Callable):
 
         args = kwargs['args'] = args.reduce_all()
 
-        # DiscreteFunctions may be created from CartesianDiscretizations, which in
-        # turn could be Grids or SubDomains. Both may provide arguments
-        discretizations = {getattr(kwargs[p.name], 'grid', None) for p in overrides}
-        discretizations.update({getattr(p, 'grid', None) for p in defaults})
-        discretizations.discard(None)
-        # Remove subgrids if multiple grids
-        if len(discretizations) > 1:
-            discretizations = {g for g in discretizations
-                               if not any(d.is_Derived for d in g.dimensions)}
-
         for i in discretizations:
             args.update(i._arg_values(**kwargs))
-
-        # There can only be one Grid from which DiscreteFunctions were created
-        grids = {i for i in discretizations if isinstance(i, Grid)}
-        if len(grids) > 1:
-            # We loosely tolerate multiple Grids for backwards compatibility
-            # with spacial subsampling, which should be revisited however. And
-            # With MPI it would definitely break!
-            if configuration['mpi']:
-                raise ValueError("Multiple Grids found")
-        try:
-            grid = grids.pop()
-        except KeyError:
-            grid = None
 
         # An ArgumentsMap carries additional metadata that may be used by
         # the subsequent phases of the arguments processing
@@ -703,6 +711,15 @@ class Operator(Callable):
                 "due to excessive register pressure in one of the Operator "
                 "kernels. Try supplying a smaller `par-tile` value."
             )
+        elif retval == error_mapper['KernelLaunchClusterConfig']:
+            raise ExecutionError(
+                "Kernel launch failed due to an invalid thread block cluster "
+                "configuration. This is probably due to a `tbc-tile` value that "
+                "does not perfectly divide the number of blocks launched for a "
+                "kernel. This is a known, strong limitation which effectively "
+                "prevents the use of `tbc-tile` in realistic scenarios, but it "
+                "will be removed in future versions."
+            )
         elif retval == error_mapper['KernelLaunchUnknown']:
             raise ExecutionError(
                 "Kernel launch failed due to an unknown error. This might "
@@ -753,12 +770,29 @@ class Operator(Callable):
         return Signer._digest(self, configuration)
 
     @cached_property
+    def _printer(self):
+        return self._Target.Printer
+
+    @cached_property
+    def description(self):
+        return f"Devito generated code for Operator `{self.name}`"
+
+    @cached_property
+    def headers(self):
+        return OrderedSet(*self._printer._headers).union(self._headers)
+
+    @cached_property
+    def includes(self):
+        return OrderedSet(*self._printer._includes).union(self._includes)
+
+    @cached_property
+    def namespaces(self):
+        return OrderedSet(*self._printer._namespaces).union(self._namespaces)
+
+    @cached_property
     def ccode(self):
-        try:
-            return self._ccode_handler(compiler=self._compiler).visit(self)
-        except (AttributeError, TypeError):
-            from devito.ir.iet.visitors import CGen
-            return CGen(compiler=self._compiler).visit(self)
+        from devito.ir.iet.visitors import CGen
+        return CGen(printer=self._printer).visit(self)
 
     def _jit_compile(self):
         """
@@ -773,11 +807,11 @@ class Operator(Callable):
 
             elapsed = self._profiler.py_timers['jit-compile']
             if recompiled:
-                perf("Operator `%s` jit-compiled `%s` in %.2f s with `%s`" %
-                     (self.name, src_file, elapsed, self._compiler))
+                perf(f"Operator `{self.name}` jit-compiled `{src_file}` in "
+                     f"{elapsed:.2f} s with `{self._compiler}`")
             else:
-                perf("Operator `%s` fetched `%s` in %.2f s from jit-cache" %
-                     (self.name, src_file, elapsed))
+                perf(f"Operator `{self.name}` fetched `{src_file}` in "
+                     f"{elapsed:.2f} s from jit-cache")
 
     @property
     def cfunction(self):
@@ -811,7 +845,7 @@ class Operator(Callable):
         dest = self._compiler.get_jit_dir()
         name = dest.joinpath(self.name)
 
-        cfile = name.with_suffix(".%s" % self._compiler.src_ext)
+        cfile = name.with_suffix(f".{self._compiler.src_ext}")
         hfile = name.with_suffix('.h')
 
         # Generate the .c and .h code
@@ -819,11 +853,11 @@ class Operator(Callable):
 
         for f, code in [(cfile, ccode), (hfile, hcode)]:
             if not force and f.is_file():
-                debug("`%s` was not saved in `%s` as it already exists" % (f.name, dest))
+                debug(f"`{f.name}` was not saved in `{dest}` as it already exists")
             else:
                 with open(str(f), 'w') as ff:
                     ff.write(str(code))
-                debug("`%s` successfully saved in `%s`" % (f.name, dest))
+                debug(f"`{f.name}` successfully saved in `{dest}`")
 
         return ccode, hcode
 
@@ -894,6 +928,10 @@ class Operator(Callable):
         >>> op = Operator(Eq(u3.forward, u3 + 1))
         >>> summary = op.apply(time_M=10)
         """
+        # Compile the operator before building the arguments list
+        # to avoid out of memory with greedy compilers
+        cfunction = self.cfunction
+
         # Build the arguments list to invoke the kernel function
         with self._profiler.timer_on('arguments'):
             args = self.arguments(**kwargs)
@@ -901,7 +939,6 @@ class Operator(Callable):
         # Invoke kernel function with args
         arg_values = [args[p.name] for p in self.parameters]
         try:
-            cfunction = self.cfunction
             with self._profiler.timer_on('apply', comm=args.comm):
                 retval = cfunction(*arg_values)
         except ctypes.ArgumentError as e:
@@ -937,7 +974,7 @@ class Operator(Callable):
         timings = self._profiler.py_timers.copy()
 
         tot = timings.pop('op-compile')
-        perf("Operator `%s` generated in %.2f s" % (self.name, fround(tot)))
+        perf(f"Operator `{self.name}` generated in {fround(tot):.2f} s")
 
         max_hotspots = 3
         threshold = 20.
@@ -949,14 +986,14 @@ class Operator(Callable):
                 v = fround(timings[i]['total'])
                 perc = fround(v/tot*100, n=10)
                 if perc > threshold:
-                    perf("%s%s: %.2f s (%.1f %%)" % (indent, i.lstrip('_'), v, perc))
+                    perf(f"{indent}{i.lstrip('_')}: {v:.2f} s ({perc:.1f} %)")
                     _emit_timings(timings[i], ' '*len(indent) + ' * ')
 
         _emit_timings(timings, '  * ')
 
         if self._profiler._ops:
             ops = ['%d --> %d' % i for i in self._profiler._ops]
-            perf("Flops reduction after symbolic optimization: [%s]" % ' ; '.join(ops))
+            perf(f"Flops reduction after symbolic optimization: [{' ; '.join(ops)}]")
 
     def _emit_apply_profiling(self, args):
         """Produce a performance summary of the profiled sections."""
@@ -964,7 +1001,7 @@ class Operator(Callable):
         fround = lambda i: ceil(i * 100) / 100
 
         elapsed = fround(self._profiler.py_timers['apply'])
-        info("Operator `%s` ran in %.2f s" % (self.name, elapsed))
+        info(f"Operator `{self.name}` ran in {elapsed:.2f} s")
 
         summary = self._profiler.summary(args, self._dtype, reduce_over=elapsed)
 
@@ -982,16 +1019,16 @@ class Operator(Callable):
             v = summary.globals.get('vanilla')
             if v is not None:
                 if v.oi is not None:
-                    metrics.append("OI=%.2f" % fround(v.oi))
+                    metrics.append(f"OI={fround(v.oi):.2f}")
                 if v.gflopss is not None and np.isfinite(v.gflopss):
-                    metrics.append("%.2f GFlops/s" % fround(v.gflopss))
+                    metrics.append(f"{fround(v.gflopss):.2f} GFlops/s")
 
             v = summary.globals.get('fdlike')
             if v is not None:
-                metrics.append("%.2f GPts/s" % fround(v.gpointss))
+                metrics.append(f"{fround(v.gpointss):.2f} GPts/s")
 
             if metrics:
-                perf("Global performance: [%s]" % ', '.join(metrics))
+                perf(f"Global performance: [{', '.join(metrics)}]")
 
             # Same as above, but excluding the setup phase, e.g. the CPU-GPU
             # data transfers in the case of a GPU run, mallocs, frees, etc.
@@ -999,10 +1036,10 @@ class Operator(Callable):
 
             v = summary.globals.get('fdlike-nosetup')
             if v is not None:
-                metrics.append("%.2f s" % fround(v.time))
-                metrics.append("%.2f GPts/s" % fround(v.gpointss))
+                metrics.append(f"{fround(v.time):.2f} s")
+                metrics.append(f"{fround(v.gpointss):.2f} GPts/s")
 
-                perf("Global performance <w/o setup>: [%s]" % ', '.join(metrics))
+                perf(f"Global performance <w/o setup>: [{', '.join(metrics)}]")
 
             # Prepare for the local performance indicators
             perf("Local performance:")
@@ -1015,34 +1052,33 @@ class Operator(Callable):
         def lower_perfentry(v):
             values = []
             if v.oi:
-                values.append("OI=%.2f" % fround(v.oi))
+                values.append(f"OI={fround(v.oi):.2f}")
             if v.gflopss:
-                values.append("%.2f GFlops/s" % fround(v.gflopss))
+                values.append(f"{fround(v.gflopss):.2f} GFlops/s")
             if v.gpointss:
-                values.append("%.2f GPts/s" % fround(v.gpointss))
+                values.append(f"{fround(v.gpointss):.2f} GPts/s")
 
             if values:
-                return "[%s]" % ", ".join(values)
+                return f"[{', '.join(values)}]"
             else:
                 return ""
 
         for k, v in summary.items():
-            rank = "[rank%d]" % k.rank if k.rank is not None else ""
-            name = "%s%s" % (k.name, rank)
+            rank = f"[rank{k.rank}]" if k.rank is not None else ''
+            name = f"{k.name}{rank}"
 
             if v.time <= 0.01:
                 # Trim down the output for very fast sections
-                perf("%s* %s ran in %.2f s" % (indent, name, fround(v.time)))
+                perf(f"{indent}* {name} ran in {fround(v.time):.2f} s")
                 continue
 
             metrics = lower_perfentry(v)
-            perf("%s* %s ran in %.2f s %s" % (indent, name, fround(v.time), metrics))
+            perf(f"{indent}* {name} ran in {fround(v.time):.2f} s {metrics}")
             for n, v1 in summary.subsections.get(k.name, {}).items():
                 metrics = lower_perfentry(v1)
 
-                perf("%s+ %s ran in %.2f s [%.2f%%] %s" %
-                     (indent*2, n, fround(v1.time), fround(v1.time/v.time*100),
-                      metrics))
+                perf(f"{indent*2}+ {n} ran in {fround(v1.time):.2f} s "
+                     f"[{fround(v1.time/v.time*100):.2f}%] {metrics}")
 
         # Emit performance mode and arguments
         perf_args = {}
@@ -1060,7 +1096,7 @@ class Operator(Callable):
         if is_integer(self.npthreads):
             perf_args['pthreads'] = self.npthreads
         perf_args = {k: perf_args[k] for k in sorted(perf_args)}
-        perf("Performance[mode=%s] arguments: %s" % (self._mode, perf_args))
+        perf(f"Performance[mode={self._mode}] arguments: {perf_args}")
 
         return summary
 
@@ -1111,8 +1147,37 @@ class Operator(Callable):
             self._lib.name = soname
 
         self._allocator = default_allocator(
-            '%s.%s.%s' % (self._compiler.name, self._language, self._platform)
+            f'{type(self._compiler).__name__}.{self._language}.{self._platform}'
         )
+
+
+# *** Recursive compilation ("rcompile") machinery
+
+
+class RCompiles(CacheInstances):
+
+    """
+    A cache for abstract Callables obtained from lowering expressions.
+    Here, "abstract Callable" means that any user-level symbolic object appearing
+    in the input expressions is replaced by a corresponding abstract object.
+    """
+
+    _instance_cache_size = None
+
+    def __init__(self, exprs, cls):
+        self.exprs = exprs
+        self.cls = cls
+
+        # NOTE: Constructed lazily at `__call__` time because `**kwargs` is
+        # unhashable for historical reasons (e.g., Compiler objects are mutable,
+        # though in practice they are unique per Operator, so only "locally"
+        # mutable)
+        self._output = None
+
+    def compile(self, **kwargs):
+        if self._output is None:
+            self._output = self.cls._lower(self.exprs, **kwargs)
+        return self._output
 
 
 # Default action (perform or bypass) for selected compilation passes upon
@@ -1132,6 +1197,7 @@ def rcompile(expressions, kwargs, options, target=None):
     """
     Perform recursive compilation on an ordered sequence of symbolic expressions.
     """
+    expressions = as_tuple(expressions)
     options = {**options, **rcompile_registry}
 
     if target is None:
@@ -1146,10 +1212,14 @@ def rcompile(expressions, kwargs, options, target=None):
     # Recursive profiling not supported -- would be a complete mess
     kwargs.pop('profiler', None)
 
-    return cls._lower(expressions, **kwargs)
+    # Recursive compilation is expensive, so we cache the result because sometimes
+    # it is called multiple times for the same input
+    compiled = RCompiles(expressions, cls).compile(**kwargs)
+
+    return compiled
 
 
-# Misc helpers
+# *** Misc helpers
 
 
 IRs = namedtuple('IRs', 'expressions clusters stree uiet iet')
@@ -1273,7 +1343,11 @@ class ArgumentsMap(dict):
                     continue
                 try:
                     if i._mem_mapped:
-                        mapper[device_layer] -= i.nbytes
+                        try:
+                            v = self[i.name]._obj.nbytes
+                        except AttributeError:
+                            v = i.nbytes
+                        mapper[device_layer] -= v
                 except AttributeError:
                     pass
 
@@ -1301,7 +1375,7 @@ def parse_kwargs(**kwargs):
             warning("Both `dle` and `opt` were passed; ignoring `dle` argument")
             opt = kwargs.pop('opt')
         else:
-            warning("Setting `opt=%s`" % str(dle))
+            warning(f"Setting `opt={str(dle)}`")
             opt = dle
     elif 'opt' in kwargs:
         opt = kwargs.pop('opt')
@@ -1310,6 +1384,10 @@ def parse_kwargs(**kwargs):
 
     if not opt or isinstance(opt, str):
         mode, options = opt, {}
+        # Legacy Operator(..., opt='openmp', ...) support
+        if mode == 'openmp':
+            mode = 'noop'
+            options = {'openmp': True}
     elif isinstance(opt, tuple):
         if len(opt) == 0:
             mode, options = 'noop', {}
@@ -1321,12 +1399,12 @@ def parse_kwargs(**kwargs):
         else:
             mode, options = tuple(flatten(i.split(',') for i in opt)), {}
     else:
-        raise InvalidOperator("Illegal `opt=%s`" % str(opt))
+        raise InvalidOperator(f"Illegal `opt={str(opt)}`")
 
     # `opt`, deprecated kwargs
     kwopenmp = kwargs.get('openmp', options.get('openmp'))
     if kwopenmp is None:
-        openmp = kwargs.get('language', configuration['language']) == 'openmp'
+        openmp = 'openmp' in kwargs.get('language', configuration['language'])
     else:
         openmp = kwopenmp
 
@@ -1341,7 +1419,7 @@ def parse_kwargs(**kwargs):
     for i in deprecated_options:
         try:
             options.pop(i)
-            warning("Ignoring deprecated optimization option `%s`" % i)
+            warning(f"Ignoring deprecated optimization option `{i}`")
         except KeyError:
             pass
     kwargs['options'] = options
@@ -1357,7 +1435,7 @@ def parse_kwargs(**kwargs):
         if not isinstance(platform, str):
             raise ValueError("Argument `platform` should be a `str`")
         if platform not in configuration._accepted['platform']:
-            raise InvalidOperator("Illegal `platform=%s`" % str(platform))
+            raise InvalidOperator(f"Illegal `platform={str(platform)}`")
         kwargs['platform'] = platform_registry[platform]()
     else:
         kwargs['platform'] = configuration['platform']
@@ -1368,11 +1446,13 @@ def parse_kwargs(**kwargs):
         if not isinstance(language, str):
             raise ValueError("Argument `language` should be a `str`")
         if language not in configuration._accepted['language']:
-            raise InvalidOperator("Illegal `language=%s`" % str(language))
+            raise InvalidOperator(f"Illegal `language={str(language)}`")
         kwargs['language'] = language
     elif kwopenmp is not None:
         # Handle deprecated `openmp` kwarg for backward compatibility
-        kwargs['language'] = 'openmp' if openmp else 'C'
+        omp = {'C': 'openmp', 'CXX': 'CXXopenmp'}.get(configuration['language'],
+                                                      'openmp')
+        kwargs['language'] = omp if openmp else 'C'
     else:
         kwargs['language'] = configuration['language']
 
@@ -1382,10 +1462,11 @@ def parse_kwargs(**kwargs):
         if not isinstance(compiler, str):
             raise ValueError("Argument `compiler` should be a `str`")
         if compiler not in configuration._accepted['compiler']:
-            raise InvalidOperator("Illegal `compiler=%s`" % str(compiler))
+            raise InvalidOperator(f"Illegal `compiler={str(compiler)}`")
         kwargs['compiler'] = compiler_registry[compiler](platform=kwargs['platform'],
                                                          language=kwargs['language'],
-                                                         mpi=configuration['mpi'])
+                                                         mpi=configuration['mpi'],
+                                                         name=compiler)
     elif any([platform, language]):
         kwargs['compiler'] =\
             configuration['compiler'].__new_with__(platform=kwargs['platform'],
@@ -1394,11 +1475,18 @@ def parse_kwargs(**kwargs):
     else:
         kwargs['compiler'] = configuration['compiler'].__new_with__()
 
+    # Make sure compiler and language are compatible
+    if compiler is not None and kwargs['compiler']._cpp and \
+            kwargs['language'] in ['C', 'openmp']:
+        kwargs['language'] = 'CXX' if kwargs['language'] == 'C' else 'CXXopenmp'
+    if 'CXX' in kwargs['language'] and not kwargs['compiler']._cpp:
+        kwargs['compiler'] = kwargs['compiler'].__new_with__(cpp=True)
+
     # `allocator`
     kwargs['allocator'] = default_allocator(
-        '%s.%s.%s' % (kwargs['compiler'].name,
-                      kwargs['language'],
-                      kwargs['platform'])
+        f"{kwargs['compiler'].__class__.__name__}"
+        f".{kwargs['language']}"
+        f".{kwargs['platform']}"
     )
 
     # Normalize `subs`, if any

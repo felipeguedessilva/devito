@@ -12,7 +12,6 @@ from devito.ir.support import Forward, Scope
 from devito.symbolics.manipulation import _uxreplace_registry
 from devito.tools import (Reconstructable, Tag, as_tuple, filter_ordered, flatten,
                           frozendict, is_integer, filter_sorted, EnrichedTuple)
-from devito.types import Grid
 
 __all__ = ['HaloScheme', 'HaloSchemeEntry', 'HaloSchemeException', 'HaloTouch']
 
@@ -31,18 +30,58 @@ STENCIL = HaloLabel('stencil')
 class HaloSchemeEntry(EnrichedTuple):
 
     __rargs__ = ('loc_indices', 'loc_dirs', 'halos', 'dims')
+    __rkwargs__ = ('bundle',)
 
-    def __init__(self, loc_indices, loc_dirs, halos, dims, getters=None):
-        self.loc_indices = frozendict(loc_indices)
-        self.loc_dirs = frozendict(loc_dirs)
-        self.halos = frozenset(halos)
-        self.dims = frozenset(dims)
+    def __new__(cls, loc_indices, loc_dirs, halos, dims, bundle=None, getters=None):
+        getters = cls.__rargs__ + cls.__rkwargs__
+        items = [frozendict(loc_indices), frozendict(loc_dirs),
+                 frozenset(halos), frozenset(dims), bundle]
+        kwargs = dict(zip(getters, items))
+        return super().__new__(cls, *items, getters=getters, **kwargs)
 
     def __hash__(self):
-        return hash((self.loc_indices,
-                     self.loc_dirs,
-                     self.halos,
-                     self.dims))
+        return hash((self.loc_indices, self.loc_dirs, self.halos, self.dims,
+                     self.bundle))
+
+    @cached_property
+    def loc_values(self):
+        return frozenset(self.loc_indices.values())
+
+    def merge(self, other):
+        """
+        Return a new HaloSchemeEntry that is the result of merging `other`
+        into `self`, irrespective of whether the `loc_indices` and `loc_dirs`
+        are the same or not. Thus, the returned HaloSchemeEntry will have
+        in general more halo exchanges than `self`, or exactly the same halo
+        exchanges in the worst case).
+        """
+        if self.loc_dirs != other.loc_dirs or \
+           self.bundle is not other.bundle:
+            raise HaloSchemeException(
+                "Inconsistency found while merging HaloSchemeEntries"
+            )
+
+        halos = self.halos | other.halos
+        dims = self.dims | other.dims
+
+        return HaloSchemeEntry(self.loc_indices, self.loc_dirs, halos, dims,
+                               bundle=self.bundle, getters=self.getters)
+
+    def union(self, other):
+        """
+        Return a new HaloSchemeEntry that is the union of this and `other`.
+        The `loc_indices` and `loc_dirs` must be the same, otherwise an
+        exception is raised. This is a more restrictive version of `merge`,
+        which is used when we want to ensure that the halo exchanges are
+        performed at the same time index, i.e., the same `loc_indices` are
+        are expected.
+        """
+        if self.loc_indices != other.loc_indices:
+            raise HaloSchemeException(
+                "Inconsistency found while taking the union of HaloSchemeEntries"
+            )
+
+        return self.merge(other)
 
 
 Halo = namedtuple('Halo', 'dim side')
@@ -154,7 +193,7 @@ class HaloScheme:
                 elif not v.loc_indices or hse.loc_indices == v.loc_indices:
                     loc_indices, loc_dirs = hse.loc_indices, hse.loc_dirs
                 else:
-                    # The `loc_dirs` must match otherwise it'd be a symptom there's
+                    # These must match otherwise it'd be a symptom there's
                     # something horribly broken elsewhere!
                     assert hse.loc_dirs == v.loc_dirs
                     assert list(hse.loc_indices) == list(v.loc_indices)
@@ -171,7 +210,11 @@ class HaloScheme:
                 halos = hse.halos | v.halos
                 dims = hse.dims | v.dims
 
-                fmapper[k] = HaloSchemeEntry(loc_indices, loc_dirs, halos, dims)
+                assert hse.bundle is v.bundle
+
+                fmapper[k] = HaloSchemeEntry(
+                    loc_indices, loc_dirs, halos, dims, bundle=hse.bundle
+                )
 
             # Compute the `honored` union
             for d, v in i.honored.items():
@@ -363,6 +406,10 @@ class HaloScheme:
         return mapper
 
     @cached_property
+    def functions(self):
+        return frozenset(self.fmapper)
+
+    @cached_property
     def dimensions(self):
         retval = set()
         for i in set().union(*self.halos.values()):
@@ -391,6 +438,38 @@ class HaloScheme:
     def arguments(self):
         return self.dimensions | set(flatten(self.honored.values()))
 
+    def issubset(self, other):
+        """
+        Check if `self` is a subset of `other`.
+        """
+        if not isinstance(other, HaloScheme):
+            return False
+
+        if not all(f in other.fmapper for f in self.fmapper):
+            return False
+
+        for f, hse0 in self.fmapper.items():
+            hse1 = other.fmapper[f]
+
+            # Clearly, `hse0`'s halos must be a subset of `hse1`'s halos...
+            if not hse0.halos.issubset(hse1.halos) or \
+               hse0.bundle is not hse1.bundle:
+                return False
+
+            # But now, to be a subset, `hse0`'s must be expecting such halos
+            # at a time index that is less than or equal to that of `hse1`
+            if hse0.loc_dirs != hse1.loc_dirs:
+                return False
+
+            loc_dirs = hse0.loc_dirs
+            raw_loc_indices = {d: (hse0.loc_indices[d], hse1.loc_indices[d])
+                               for d in hse0.loc_indices}
+            projected_loc_indices, _ = process_loc_indices(raw_loc_indices, loc_dirs)
+            if projected_loc_indices != hse1.loc_indices:
+                return False
+
+        return True
+
     def project(self, functions):
         """
         Create a new HaloScheme that only retains the HaloSchemeEntries corresponding
@@ -411,10 +490,21 @@ class HaloScheme:
         """
         Create a new HaloScheme that contains all entries in `self` plus the one
         passed in input. If `f` already exists in `self`, the old value is
-        overridden.
+        augmented with `hse` (i.e., the halos are unioned).
         """
-        fmapper = dict(self.fmapper.items())
+        fmapper = dict(self.fmapper)
+        if f in fmapper:
+            hse = fmapper[f].union(hse)
         fmapper[f] = hse
+        return HaloScheme.build(fmapper, self.honored)
+
+    def merge(self, hs):
+        """
+        Create a new HaloScheme that is the result of merging `hs` into `self`.
+        """
+        fmapper = dict(self.fmapper)
+        for f, hse in hs.fmapper.items():
+            fmapper[f] = fmapper.get(f, hse).merge(hse)
         return HaloScheme.build(fmapper, self.honored)
 
 
@@ -435,8 +525,7 @@ def classify(exprs, ispace):
     for f, r in scope.reads.items():
         if not f.is_DiscreteFunction:
             continue
-        elif not isinstance(f.grid, Grid):
-            # TODO: improve me
+        elif f.grid is None:
             continue
 
         # In the case of custom topologies, we ignore the Dimensions that aren't
@@ -585,7 +674,7 @@ class HaloTouch(sympy.Function, Reconstructable):
     A SymPy object representing halo accesses through a HaloScheme.
     """
 
-    __rargs__ = ('args',)
+    __rargs__ = ('*args',)
     __rkwargs__ = ('halo_scheme',)
 
     def __new__(cls, *args, halo_scheme=None, **kwargs):
@@ -602,10 +691,12 @@ class HaloTouch(sympy.Function, Reconstructable):
         return str(self)
 
     def __hash__(self):
-        return hash(self.halo_scheme)
+        return hash((self.halo_scheme, *super()._hashable_content()))
 
     def __eq__(self, other):
-        return isinstance(other, HaloTouch) and self.halo_scheme == other.halo_scheme
+        return (isinstance(other, HaloTouch) and
+                self.args == other.args and
+                self.halo_scheme == other.halo_scheme)
 
     func = Reconstructable._rebuild
 
@@ -626,8 +717,12 @@ def _uxreplace_dispatch_haloscheme(hs0, rule):
         for i, v in rule.items():
             if i is f:
                 # Yes!
-                g = v
-                hse = hse0
+                if v.is_Bundle:
+                    g = f
+                    hse = hse0._rebuild(bundle=v)
+                else:
+                    g = v
+                    hse = hse0
 
             elif i.is_Indexed and i.function is f and v.is_Indexed:
                 # Yes, but through an Indexed, hence the `loc_indices` may now

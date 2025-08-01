@@ -1,6 +1,7 @@
 """The Iteration/Expression Tree (IET) hierarchy."""
 
 import abc
+import ctypes
 import inspect
 from functools import cached_property
 from collections import OrderedDict, namedtuple
@@ -10,11 +11,12 @@ import cgen as c
 from sympy import IndexedBase, sympify
 
 from devito.data import FULL
+from devito.ir.cgen import ccode
 from devito.ir.equations import DummyEq, OpInc, OpMin, OpMax
 from devito.ir.support import (INBOUND, SEQUENTIAL, PARALLEL, PARALLEL_IF_ATOMIC,
                                PARALLEL_IF_PVT, VECTORIZED, AFFINE, Property,
                                Forward, WithLock, PrefetchUpdate, detect_io)
-from devito.symbolics import ListInitializer, CallFromPointer, ccode
+from devito.symbolics import ListInitializer, CallFromPointer
 from devito.tools import (Signer, as_tuple, filter_ordered, filter_sorted, flatten,
                           ctypes_to_cstr)
 from devito.types.basic import (AbstractFunction, AbstractSymbol, Basic, Indexed,
@@ -28,7 +30,7 @@ __all__ = ['Node', 'MultiTraversable', 'Block', 'Expression', 'Callable',
            'Increment', 'Return', 'While', 'ListMajor', 'ParallelIteration',
            'ParallelBlock', 'Dereference', 'Lambda', 'SyncSpot', 'Pragma',
            'DummyExpr', 'BlankLine', 'ParallelTree', 'BusyWait', 'UsingNamespace',
-           'CallableBody', 'Transfer']
+           'Using', 'CallableBody', 'Transfer', 'EmptyList']
 
 # First-class IET nodes
 
@@ -60,12 +62,6 @@ class Node(Signer):
     :attr:`_traversable`. The traversable fields of the Node; that is, fields
     walked over by a Visitor. All arguments in __init__ whose name
     appears in this list are treated as traversable fields.
-    """
-
-    _ccode_handler = None
-    """
-    Customizable by subclasses, in particular Operator subclasses which define
-    backend-specific nodes and, as such, require node-specific handlers.
     """
 
     def __new__(cls, *args, **kwargs):
@@ -106,9 +102,15 @@ class Node(Signer):
 
     @property
     def view(self):
-        """A representation of the IET rooted in ``self``."""
+        """A high-level representation of the IET rooted in `self`."""
         from devito.ir.iet.visitors import printAST
         return printAST(self)
+
+    @property
+    def view_cir(self):
+        from devito.ir.iet.visitors import CGen
+        from devito.passes.iet.languages.CIR import CIRPrinter
+        return str(CGen(printer=CIRPrinter).visit(self))
 
     @property
     def children(self):
@@ -152,7 +154,7 @@ class Node(Signer):
         return ()
 
     def _signature_items(self):
-        return (str(self.ccode),)
+        return (self.view_cir,)
 
 
 class ExprStmt:
@@ -214,6 +216,11 @@ class List(Node):
     def __repr__(self):
         return "<%s (%d, %d, %d)>" % (self.__class__.__name__, len(self.header),
                                       len(self.body), len(self.footer))
+
+
+class EmptyList(List):
+    """A plain List node without a body, such as a header/footer only"""
+    _traversable = []
 
 
 class Block(List):
@@ -718,9 +725,13 @@ class Callable(Node):
     parameters : list of Basic, optional
         The objects in input to the Callable.
     prefix : list of str, optional
-        Qualifiers to prepend to the Callable signature. None by defaults.
+        Qualifiers to prepend to the Callable signature. None by default.
     templates : list of Basic, optional
         The template parameters of the Callable.
+    attributes : list of str, optional
+        Additional attributes to append to the Callable signature. An
+        attributes is one or more keywords that appear in between the
+        return type and the function name. None by default.
     """
 
     is_Callable = True
@@ -728,7 +739,7 @@ class Callable(Node):
     _traversable = ['body']
 
     def __init__(self, name, body, retval, parameters=None, prefix=None,
-                 templates=None):
+                 templates=None, attributes=None):
         self.name = name
         if not isinstance(body, CallableBody):
             self.body = CallableBody(body)
@@ -738,6 +749,7 @@ class Callable(Node):
         self.prefix = as_tuple(prefix)
         self.parameters = as_tuple(parameters)
         self.templates = as_tuple(templates)
+        self.attributes = as_tuple(attributes)
 
     def __repr__(self):
         param_types = [ctypes_to_cstr(i._C_ctype) for i in self.parameters]
@@ -1038,6 +1050,8 @@ class Dereference(ExprStmt, Node):
         * `pointer` is a PointerArray or TempFunction, and `pointee` is an Array.
         * `pointer` is an ArrayObject representing a pointer to a C struct, and
           `pointee` is a field in `pointer`.
+        * `pointer` is a Symbol with its _C_ctype deriving from ct._Pointer, and
+          `pointee` is a Symbol representing the dereferenced value.
     """
 
     is_Dereference = True
@@ -1056,13 +1070,18 @@ class Dereference(ExprStmt, Node):
 
     @property
     def expr_symbols(self):
-        ret = [self.pointer.indexed]
-        if self.pointer.is_PointerArray or self.pointer.is_TempFunction:
-            ret.append(self.pointee.indexed)
-            ret.extend(flatten(i.free_symbols for i in self.pointee.symbolic_shape[1:]))
+        ret = []
+        if self.pointer.is_Symbol:
+            assert issubclass(self.pointer._C_ctype, ctypes._Pointer), \
+                   "Scalar dereference must have a pointer ctype"
+            ret.extend([self.pointer._C_symbol, self.pointee._C_symbol])
+        elif self.pointer.is_PointerArray or self.pointer.is_TempFunction:
+            ret.extend([self.pointer.indexed, self.pointee.indexed])
+            ret.extend(flatten(i.free_symbols
+                               for i in self.pointee.symbolic_shape[1:]))
             ret.extend(self.pointer.free_symbols)
         else:
-            ret.append(self.pointee._C_symbol)
+            ret.extend([self.pointer.indexed, self.pointee._C_symbol])
         return tuple(filter_ordered(ret))
 
     @property
@@ -1207,6 +1226,19 @@ class Prodder(Call):
     @property
     def periodic(self):
         return self._periodic
+
+
+class Using(Node):
+
+    """
+    A C++ using directive.
+    """
+
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return "<Using(%s)>" % self.name
 
 
 class UsingNamespace(Node):
@@ -1489,8 +1521,8 @@ class HaloSpot(Node):
         return self.halo_scheme.arguments
 
     @property
-    def is_empty(self):
-        return len(self.halo_scheme) == 0
+    def is_void(self):
+        return self.halo_scheme.is_void
 
     @property
     def body(self):

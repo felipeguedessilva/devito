@@ -6,21 +6,21 @@ concurrency:
 
 on:
   # Trigger the workflow on push or pull request,
-  # but only for the master branch
+  # but only for the main branch
   push:
     branches:
-      - master
+      - main
   pull_request:
     branches:
-      - master
+      - main
 
 jobs:
   test-mpi-basic:
     name: pytest-mpi
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.9', '3.11']
+        python-version: ['3.10', '3.11']
 
     env:
       DEVITO_LANGUAGE: "openmp"
@@ -28,6 +28,7 @@ jobs:
       OMP_NUM_THREADS: "1"
       CC: "gcc-9"
       CXX: "g++-9"
+      RDMAV_FORK_SAFE: 1
 
     steps:
     - uses: actions/setup-python@v5
@@ -41,7 +42,7 @@ jobs:
       run: |
         sudo apt-get update && sudo apt install mpich -y
         pip3 install --upgrade pip
-        pip3 install -e .[extras,mpi,tests]
+        pip3 install -e ".[extras,mpi,tests]" --no-binary=mpi4py
 
     - name: Test with pytest
       run: |
@@ -55,7 +56,7 @@ jobs:
         DEVITO_MPI=1 mpirun -n 2 python3 -m pytest examples/seismic/tti
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         name: pytest-mpi
@@ -76,20 +77,20 @@ jobs:
               os: ubuntu-latest
               # Need safe math for icx due to inaccuracy with mpi+sinc interpolation
               mpiflag: "-e DEVITO_SAFE_MATH=1"
-      
+
       steps:
       - name: Checkout devito
         uses: actions/checkout@v4
-      
+
       - name: Build docker image
         run: |
           docker build . --file docker/Dockerfile.devito --tag devito_img --build-arg base=devitocodes/bases:cpu-${{ matrix.arch }}
-      
+
       - name: Test with pytest
         run: |
-          docker run --rm -t -e CODECOV_TOKEN=${{ secrets.CODECOV_TOKEN }} -e OMP_NUM_THREADS=1 --name testrun devito_img pytest tests/test_mpi.py
+          docker run --init -t --rm -e CODECOV_TOKEN=${{ secrets.CODECOV_TOKEN }} -e OMP_NUM_THREADS=1 --name testrun devito_img pytest tests/test_mpi.py
 
       - name: Test examples with MPI
         run: |
-          docker run --rm -t ${{ matrix.mpiflag }} -e DEVITO_MPI=1 -e OMP_NUM_THREADS=1 --name examplerun devito_img mpiexec -n 2 pytest examples/seismic/acoustic
-          docker run --rm -t -e DEVITO_MPI=1 -e OMP_NUM_THREADS=1 --name examplerun devito_img mpiexec -n 2 pytest examples/seismic/tti
+          docker run --init -t --rm ${{ matrix.mpiflag }} -e DEVITO_MPI=1 -e OMP_NUM_THREADS=1 --name examplerun devito_img mpiexec -n 2 pytest examples/seismic/acoustic
+          docker run --init -t --rm -e DEVITO_MPI=1 -e OMP_NUM_THREADS=1 --name examplerun devito_img mpiexec -n 2 pytest examples/seismic/tti
