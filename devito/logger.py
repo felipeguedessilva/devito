@@ -4,9 +4,20 @@ import logging
 import sys
 from contextlib import contextmanager
 
-__all__ = ('set_log_level', 'set_log_noperf', 'is_log_enabled_for', 'switch_log_level',
-           'log', 'warning', 'error', 'perf', 'hint',
-           'RED', 'GREEN', 'BLUE')
+__all__ = (
+    'BLUE',
+    'GREEN',
+    'RED',
+    'error',
+    'hint',
+    'is_log_enabled_for',
+    'log',
+    'perf',
+    'set_log_level',
+    'set_log_noperf',
+    'switch_log_level',
+    'warning',
+)
 
 
 logger = logging.getLogger('Devito')
@@ -56,7 +67,7 @@ def _set_log_level(level):
     Set the level of the Devito logger.
     """
     if level not in logger_registry:
-        raise ValueError("Illegal logging level %s" % level)
+        raise ValueError(f"Illegal logging level {level}")
 
     logger.setLevel(level)
 
@@ -150,7 +161,7 @@ def perf(msg, *args, **kwargs):
 
 
 def hint(msg, *args, **kwargs):
-    log("Hint: %s" % msg, PERF, *args, **kwargs)
+    log(f"Hint: {msg}", PERF, *args, **kwargs)
 
 
 def warning(msg, *args, **kwargs):

@@ -2,26 +2,29 @@
 Extended SymPy hierarchy.
 """
 import re
+from contextlib import suppress
 
 import numpy as np
 import sympy
 from sympy import Expr, Function, Number, Tuple, cacheit, sympify
 from sympy.core.decorators import call_highest_priority
+from sympy.logic.boolalg import BooleanFunction
 
-from devito.finite_differences.elementary import Min, Max
-from devito.tools import (Pickable, Bunch, as_tuple, is_integer, float2,  # noqa
-                          float3, float4, double2, double3, double4, int2, int3,
-                          int4, dtype_to_ctype, ctypes_to_cstr, ctypes_vector_mapper,
-                          ctypes_to_cstr)
+from devito.finite_differences.elementary import Max, Min
+from devito.tools import (  # noqa
+    Bunch, Pickable, as_tuple, ctypes_to_cstr, ctypes_vector_mapper, double2, double3,
+    double4, dtype_to_ctype, float2, float3, float4, int2, int3, int4, is_integer
+)
 from devito.types import Symbol
 from devito.types.basic import Basic
 
-__all__ = ['CondEq', 'CondNe', 'IntDiv', 'CallFromPointer',  # noqa
+__all__ = ['CondEq', 'CondNe', 'BitwiseNot', 'BitwiseXor', 'BitwiseAnd',  # noqa
+           'LeftShift', 'RightShift', 'IntDiv', 'CallFromPointer',
            'CallFromComposite', 'FieldFromPointer', 'FieldFromComposite',
            'ListInitializer', 'Byref', 'IndexedPointer', 'Cast', 'DefFunction',
            'MathFunction', 'InlineIf', 'ReservedWord', 'Keyword', 'String',
-           'Macro', 'Class', 'MacroArgument', 'Deref', 'Namespace',
-           'Rvalue', 'Null', 'SizeOf', 'rfunc', 'BasicWrapperMixin', 'ValueLimit',
+           'Macro', 'Class', 'MacroArgument', 'Deref', 'Namespace', 'Rvalue',
+           'Null', 'SizeOf', 'rfunc', 'BasicWrapperMixin', 'ValueLimit',
            'VectorAccess']
 
 
@@ -61,6 +64,34 @@ class CondNe(sympy.Ne):
     @property
     def negated(self):
         return CondEq(*self.args, evaluate=False)
+
+
+class BitwiseNot(BooleanFunction):
+    op = '~'
+
+
+class BitwiseBinaryOp(BooleanFunction):
+    op = ''
+
+    # Enforce two args
+    def __new__(cls, arg0, arg1, **kwargs):
+        return super().__new__(cls, arg0, arg1, **kwargs)
+
+
+class BitwiseXor(BitwiseBinaryOp):
+    op = '^'
+
+
+class BitwiseAnd(BitwiseBinaryOp):
+    op = '&'
+
+
+class LeftShift(BitwiseBinaryOp):
+    op = '<<'
+
+
+class RightShift(BitwiseBinaryOp):
+    op = '>>'
 
 
 class IntDiv(sympy.Expr):
@@ -172,9 +203,9 @@ class CallFromPointer(sympy.Expr, Pickable, BasicWrapperMixin):
             pointer = Symbol(pointer)
         if isinstance(call, str):
             call = Symbol(call)
-        elif not isinstance(call, Basic):
-            raise ValueError("`call` must be a `devito.Basic` or a type "
-                             "with compatible interface")
+        elif not isinstance(call, (BasicWrapperMixin, Basic)):
+            raise ValueError(f"`call` {call} must be a `devito.Basic` or a type "
+                             f"with compatible interface, not {type(call)}")
         _params = []
         for p in as_tuple(params):
             if isinstance(p, str):
@@ -184,8 +215,8 @@ class CallFromPointer(sympy.Expr, Pickable, BasicWrapperMixin):
             else:
                 try:
                     _params.append(Number(p))
-                except TypeError:
-                    raise ValueError("`params` must be Expr, numbers or str")
+                except TypeError as e:
+                    raise ValueError("`params` must be Expr, numbers or str") from e
         params = Tuple(*_params)
 
         obj = sympy.Expr.__new__(cls, call, pointer, params)
@@ -300,8 +331,8 @@ class ListInitializer(sympy.Expr, Pickable):
         for p in as_tuple(params):
             try:
                 args.append(sympify(p))
-            except sympy.SympifyError:
-                raise ValueError(f"Illegal param `{p}`")
+            except sympy.SympifyError as e:
+                raise ValueError(f"Illegal param `{p}`") from e
         obj = sympy.Expr.__new__(cls, *args)
 
         obj.params = tuple(args)
@@ -337,11 +368,8 @@ class UnaryOp(sympy.Expr, Pickable, BasicWrapperMixin):
             # If an AbstractFunction, pull the underlying Symbol
             base = base.indexed.label
         except AttributeError:
-            if isinstance(base, str):
-                base = Symbol(base)
-            else:
-                # Fallback: go plain sympy
-                base = sympify(base)
+            # Fallback: go plain sympy
+            base = Symbol(base) if isinstance(base, str) else sympify(base)
 
         obj = sympy.Expr.__new__(cls, base)
         obj._base = base
@@ -446,10 +474,8 @@ class Cast(UnaryOp):
     @property
     def _C_ctype(self):
         ctype = ctypes_vector_mapper.get(self.dtype, self.dtype)
-        try:
+        with suppress(TypeError):
             ctype = dtype_to_ctype(ctype)
-        except TypeError:
-            pass
         return ctype
 
     @property
@@ -477,7 +503,7 @@ class IndexedPointer(sympy.Expr, Pickable, BasicWrapperMixin):
             base = base.indexed.label
         except AttributeError:
             if not isinstance(base, sympy.Basic):
-                raise ValueError("`base` must be of type sympy.Basic")
+                raise ValueError("`base` must be of type sympy.Basic") from None
 
         index = Tuple(*[sympify(i) for i in as_tuple(index)])
 
@@ -644,10 +670,7 @@ class DefFunction(Function, Pickable):
         return self._template
 
     def __str__(self):
-        if self.template:
-            template = f"<{','.join(str(i) for i in self.template)}>"
-        else:
-            template = ''
+        template = f"<{','.join(str(i) for i in self.template)}>" if self.template else ''
         arguments = ', '.join(str(i) for i in self.arguments)
         return f"{self.name}{template}({arguments})"
 

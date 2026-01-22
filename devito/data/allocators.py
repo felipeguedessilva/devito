@@ -1,6 +1,6 @@
 import abc
 import ctypes
-from ctypes.util import find_library
+import ctypes.util
 import mmap
 import os
 import sys
@@ -9,11 +9,17 @@ import numpy as np
 
 from devito.logger import logger
 from devito.parameters import configuration
-from devito.tools import is_integer, infer_datasize
+from devito.tools import infer_datasize, is_integer
 
-__all__ = ['ALLOC_ALIGNED', 'ALLOC_NUMA_LOCAL', 'ALLOC_NUMA_ANY',
-           'ALLOC_KNL_MCDRAM', 'ALLOC_KNL_DRAM', 'ALLOC_GUARD',
-           'default_allocator']
+__all__ = [
+    'ALLOC_ALIGNED',
+    'ALLOC_GUARD',
+    'ALLOC_KNL_DRAM',
+    'ALLOC_KNL_MCDRAM',
+    'ALLOC_NUMA_ANY',
+    'ALLOC_NUMA_LOCAL',
+    'default_allocator',
+]
 
 
 class AbstractMemoryAllocator:
@@ -103,7 +109,7 @@ class MemoryAllocator(AbstractMemoryAllocator):
 
         padleft_pointer, memfree_args = self._alloc_C_libcall(size, ctype)
         if padleft_pointer is None:
-            raise RuntimeError("Unable to allocate %d elements in memory" % size)
+            raise RuntimeError(f"Unable to allocate {size} elements in memory")
 
         # Compute the pointer to the user data
         padleft_bytes = padleft * ctypes.sizeof(ctype)
@@ -147,7 +153,7 @@ class PosixAllocator(MemoryAllocator):
 
     @classmethod
     def initialize(cls):
-        handle = find_library('c')
+        handle = ctypes.util.find_library('c')
 
         # Special case: on MacOS Big Sur any code that attempts to check
         # for dynamic library presence by looking for a file at a path
@@ -268,7 +274,7 @@ class NumaAllocator(MemoryAllocator):
 
     @classmethod
     def initialize(cls):
-        handle = find_library('numa')
+        handle = ctypes.util.find_library('numa')
         if handle is None:
             return
         lib = ctypes.CDLL(handle)
@@ -375,11 +381,11 @@ class DataReference(MemoryAllocator):
 
     def alloc(self, shape, dtype, padding=0):
         assert shape == self.numpy_array.shape, \
-            "Provided array has shape %s. Expected %s" %\
-            (str(self.numpy_array.shape), str(shape))
+            (f"Provided array has shape {str(self.numpy_array.shape)}. "
+             f"Expected {str(shape)}")
         assert dtype == self.numpy_array.dtype, \
-            "Provided array has dtype %s. Expected %s" %\
-            (str(self.numpy_array.dtype), str(dtype))
+            (f"Provided array has dtype {str(self.numpy_array.dtype)}. "
+             f"Expected {str(dtype)}")
 
         return (self.numpy_array, None)
 
@@ -405,11 +411,11 @@ def register_allocator(name, allocator):
     Register a custom MemoryAllocator.
     """
     if not isinstance(name, str):
-        raise TypeError("name must be a str, not `%s`" % type(name))
+        raise TypeError(f"name must be a str, not `{type(name)}`)")
     if name in custom_allocators:
-        raise ValueError("A MemoryAllocator for `%s` already exists" % name)
+        raise ValueError(f"A MemoryAllocator for `{name}` already exists")
     if not isinstance(allocator, AbstractMemoryAllocator):
-        raise TypeError("Expected a MemoryAllocator, not `%s`" % type(allocator))
+        raise TypeError(f"Expected a MemoryAllocator, not `{type(allocator)}`")
 
     custom_allocators[name] = allocator
 

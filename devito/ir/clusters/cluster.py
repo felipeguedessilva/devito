@@ -1,21 +1,23 @@
-from itertools import chain
+from contextlib import suppress
 from functools import cached_property
+from itertools import chain
 
 import numpy as np
 
 from devito.ir.equations import ClusterizedEq
 from devito.ir.support import (
-    PARALLEL, PARALLEL_IF_PVT, BaseGuardBoundNext, Forward, Interval, IntervalGroup,
-    IterationSpace, DataSpace, Guards, Properties, Scope, WaitLock, WithLock,
-    PrefetchUpdate, detect_accesses, detect_io, normalize_properties,
-    tailor_properties, update_properties, normalize_syncs, minimum, maximum,
-    null_ispace
+    PARALLEL, PARALLEL_IF_PVT, BaseGuardBoundNext, DataSpace, Forward, Guards, Interval,
+    IntervalGroup, IterationSpace, PrefetchUpdate, Properties, Scope, WaitLock, WithLock,
+    detect_accesses, detect_io, maximum, minimum, normalize_properties, normalize_syncs,
+    null_ispace, tailor_properties, update_properties
 )
 from devito.mpi.halo_scheme import HaloScheme, HaloTouch
 from devito.mpi.reduction_scheme import DistReduce
 from devito.symbolics import estimate_cost
 from devito.tools import as_tuple, filter_ordered, flatten, infer_dtype
-from devito.types import Fence, WeakFence, CriticalRegion
+from devito.types import (
+    CriticalRegion, Fence, ThreadCommit, ThreadPoolSync, ThreadWait, WeakFence
+)
 
 __all__ = ["Cluster", "ClusterGroup"]
 
@@ -59,7 +61,7 @@ class Cluster:
         self._halo_scheme = halo_scheme
 
     def __repr__(self):
-        return "Cluster([%s])" % ('\n' + ' '*9).join('%s' % i for i in self.exprs)
+        return "Cluster([{}])".format(('\n' + ' '*9).join(f'{i}' for i in self.exprs))
 
     @classmethod
     def from_clusters(cls, *clusters):
@@ -69,12 +71,22 @@ class Cluster:
         """
         assert len(clusters) > 0
         root = clusters[0]
+
+        if len(clusters) == 1:
+            return root
+
         if not all(root.ispace.is_compatible(c.ispace) for c in clusters):
             raise ValueError("Cannot build a Cluster from Clusters with "
                              "incompatible IterationSpace")
         if not all(root.guards == c.guards for c in clusters):
             raise ValueError("Cannot build a Cluster from Clusters with "
                              "non-homogeneous guards")
+
+        writes = set().union(*[c.scope.writes for c in clusters])
+        reads = set().union(*[c.scope.reads for c in clusters])
+        if any(f._mem_shared for f in writes & reads):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "read-write conflicts on shared-memory Functions")
 
         exprs = chain(*[c.exprs for c in clusters])
         ispace = IterationSpace.union(*[c.ispace for c in clusters])
@@ -85,9 +97,11 @@ class Cluster:
 
         try:
             syncs = normalize_syncs(*[c.syncs for c in clusters])
-        except ValueError:
-            raise ValueError("Cannot build a Cluster from Clusters with "
-                             "non-compatible synchronization operations")
+        except ValueError as e:
+            raise ValueError(
+                "Cannot build a Cluster from Clusters with "
+                "non-compatible synchronization operations"
+            ) from e
 
         halo_scheme = HaloScheme.union([c.halo_scheme for c in clusters])
 
@@ -175,10 +189,8 @@ class Cluster:
         """
         ret = set()
         for f in self.functions:
-            try:
+            with suppress(AttributeError):
                 ret.update(f._dist_dimensions)
-            except AttributeError:
-                pass
         return frozenset(ret)
 
     @cached_property
@@ -252,26 +264,40 @@ class Cluster:
                 self.is_weak_fence or
                 self.is_critical_region)
 
+    def _is_type(self, cls):
+        return self.exprs and all(isinstance(e.rhs, cls) for e in self.exprs)
+
     @cached_property
     def is_halo_touch(self):
-        return self.exprs and all(isinstance(e.rhs, HaloTouch) for e in self.exprs)
+        return self._is_type(HaloTouch)
 
     @cached_property
     def is_dist_reduce(self):
-        return self.exprs and all(isinstance(e.rhs, DistReduce) for e in self.exprs)
+        return self._is_type(DistReduce)
 
     @cached_property
     def is_fence(self):
-        return (self.exprs and all(isinstance(e.rhs, Fence) for e in self.exprs) or
-                self.is_critical_region)
+        return self._is_type(Fence) or self.is_critical_region
 
     @cached_property
     def is_weak_fence(self):
-        return self.exprs and all(isinstance(e.rhs, WeakFence) for e in self.exprs)
+        return self._is_type(WeakFence)
 
     @cached_property
     def is_critical_region(self):
-        return self.exprs and all(isinstance(e.rhs, CriticalRegion) for e in self.exprs)
+        return self._is_type(CriticalRegion)
+
+    @cached_property
+    def is_thread_pool_sync(self):
+        return self._is_type(ThreadPoolSync)
+
+    @cached_property
+    def is_thread_commit(self):
+        return self._is_type(ThreadCommit)
+
+    @cached_property
+    def is_thread_wait(self):
+        return self._is_type(ThreadWait)
 
     @cached_property
     def is_async(self):
@@ -371,10 +397,7 @@ class Cluster:
         oobs = set()
         for f, v in parts.items():
             for i in v:
-                if i.dim.is_Sub:
-                    d = i.dim.parent
-                else:
-                    d = i.dim
+                d = i.dim.parent if i.dim.is_Sub else i.dim
                 try:
                     if i.lower < 0 or \
                        i.upper > f._size_nodomain[d].left + f._size_halo[d].right:
@@ -404,7 +427,7 @@ class Cluster:
     @cached_property
     def traffic(self):
         """
-        The Cluster compulsary traffic (number of reads/writes), as a mapper
+        The Cluster compulsory traffic (number of reads/writes), as a mapper
         from Functions to IntervalGroups.
 
         Notes
@@ -460,7 +483,16 @@ class ClusterGroup(tuple):
 
     def __new__(cls, clusters, ispace=None):
         obj = super().__new__(cls, flatten(as_tuple(clusters)))
-        obj._ispace = ispace
+
+        if ispace is not None:
+            obj._ispace = ispace
+        else:
+            # Best effort attempt to infer a common IterationSpace
+            try:
+                obj._ispace, = {c.ispace for c in obj}
+            except ValueError:
+                obj._ispace = None
+
         return obj
 
     @classmethod

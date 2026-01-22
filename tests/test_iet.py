@@ -1,23 +1,26 @@
-import pytest
-
 from ctypes import c_void_p
+
 import cgen
 import numpy as np
+import pytest
 import sympy
 
-from devito import (Eq, Grid, Function, TimeFunction, Operator, Dimension,  # noqa
-                    switchconfig)
-from devito.ir.iet import (Call, Callable, Conditional, DeviceCall, DummyExpr,
-                           Iteration, List, KernelLaunch, Lambda, ElementalFunction,
-                           CGen, FindSymbols, filter_iterations, make_efunc,
-                           retrieve_iteration_tree, Transformer)
+from devito import (  # noqa
+    Dimension, Eq, Function, Grid, Operator, TimeFunction, switchconfig
+)
 from devito.ir import SymbolRegistry
+from devito.ir.iet import (
+    Call, Callable, CGen, Conditional, Definition, Dereference, DeviceCall, DummyExpr,
+    ElementalFunction, FindSymbols, Iteration, KernelLaunch, Lambda, List, Switch,
+    Transformer, filter_iterations, make_efunc, retrieve_iteration_tree
+)
 from devito.passes.iet.engine import Graph
 from devito.passes.iet.languages.C import CDataManager
-from devito.symbolics import (Byref, FieldFromComposite, InlineIf, Macro, Class,
-                              FLOAT)
+from devito.symbolics import (
+    FLOAT, Byref, Class, FieldFromComposite, InlineIf, Macro, String
+)
 from devito.tools import CustomDtype, as_tuple, dtype_to_ctype
-from devito.types import Array, LocalObject, Symbol
+from devito.types import Array, CustomDimension, LocalObject, Pointer, Symbol
 
 
 @pytest.fixture
@@ -52,7 +55,7 @@ else
     (('Eq(v[t,x,y], v[t,x-1,y] + 1)', 'Eq(v[t,x,y], v[t,x+1,y] + u[x,y])'),
      (1, 2), (1, 1), ('xy', 'xy'))
 ])
-@switchconfig(openmp=False)
+@switchconfig(language='C')
 def test_make_efuncs(exprs, nfuncs, ntimeiters, nests):
     """Test construction of ElementalFunctions."""
     exprs = list(as_tuple(exprs))
@@ -74,11 +77,11 @@ def test_make_efuncs(exprs, nfuncs, ntimeiters, nests):
     efuncs = []
     for n, tree in enumerate(retrieve_iteration_tree(op)):
         root = filter_iterations(tree, key=lambda i: i.dim.is_Space)[0]
-        efuncs.append(make_efunc('f%d' % n, root))
+        efuncs.append(make_efunc(f'f{n}', root))
 
     assert len(efuncs) == len(nfuncs) == len(ntimeiters) == len(nests)
 
-    for efunc, nf, nt, nest in zip(efuncs, nfuncs, ntimeiters, nests):
+    for efunc, nf, nt, nest in zip(efuncs, nfuncs, ntimeiters, nests, strict=True):
         # Check the `efunc` parameters
         assert all(i in efunc.parameters for i in (x.symbolic_min, x.symbolic_max))
         assert all(i in efunc.parameters for i in (y.symbolic_min, y.symbolic_max))
@@ -95,7 +98,7 @@ def test_make_efuncs(exprs, nfuncs, ntimeiters, nests):
         trees = retrieve_iteration_tree(efunc)
         assert len(trees) == 1
         tree = trees[0]
-        assert all(i.dim.name == j for i, j in zip(tree, nest))
+        assert all(i.dim.name == j for i, j in zip(tree, nest, strict=True))
 
         assert efunc.make_call()
 
@@ -475,3 +478,64 @@ def test_codegen_quality0():
     assert len(foo.parameters) == 3
     assert len(foo1.parameters) == 1
     assert foo1.parameters[0] is a
+
+
+def test_special_array_definition():
+
+    class MyArray(Array):
+        is_extern = True
+        _data_alignment = False
+
+    dim = CustomDimension(name='d', symbolic_size=String(''))
+    a = MyArray(name='a', dimensions=dim, scope='shared', dtype=np.uint8)
+
+    assert str(Definition(a)) == "extern  unsigned char a[];"
+
+
+def test_list_inline():
+    expr0 = DummyExpr(Symbol(name='a'), 1)
+    expr1 = DummyExpr(Symbol(name='b'), 2)
+
+    lst = List(body=[expr0, expr1], inline=True)
+    assert str(lst) == """a = 1; b = 2;"""
+
+
+def test_dereference_base_plus_off():
+    ptr = Pointer(name='p', dtype=np.float32)
+    off = Symbol(name='offs', dtype=np.int32)
+
+    dim0 = CustomDimension(name='d0', symbolic_size=2)
+    dim1 = CustomDimension(name='d1', symbolic_size=3)
+    x = Array(name='x', dimensions=(dim0, dim1), dtype=np.float32)
+
+    deref = Dereference(x, ptr, offset=off)
+
+    assert str(deref) == "float (*restrict x)[3] = (float (*)[3]) (p + offs);"
+
+
+def test_switch_case():
+    flag = Symbol(name='flag')
+    a = Symbol(name='a')
+
+    cases = [0, 1]
+    nodes = [DummyExpr(a, 1), DummyExpr(a, 2)]
+    default = DummyExpr(a, 0)
+
+    switch = Switch(flag, cases, nodes, default=default)
+
+    assert str(switch) == """\
+switch (flag)
+{
+  case 0: {
+    a = 1;
+    break;
+  }
+  case 1: {
+    a = 2;
+    break;
+  }
+  default: {
+    a = 0;
+    break;
+  }
+}"""

@@ -14,15 +14,33 @@ import numpy as np
 
 from devito.exceptions import InvalidArgument
 from devito.parameters import configuration
+from devito.symbolics import search
 from devito.tools import as_list, as_tuple, is_integer
 from devito.types.array import Array, ArrayObject
 from devito.types.basic import Scalar, Symbol
 from devito.types.dimension import CustomDimension
 from devito.types.misc import Fence, VolatileInt
 
-__all__ = ['NThreads', 'NThreadsNested', 'NThreadsNonaffine', 'NThreadsBase',
-           'DeviceID', 'ThreadID', 'Lock', 'ThreadArray', 'PThreadArray',
-           'SharedData', 'NPThreads', 'DeviceRM', 'QueueID', 'Barrier', 'TBArray']
+__all__ = [
+    'Barrier',
+    'DeviceID',
+    'DeviceRM',
+    'Lock',
+    'NPThreads',
+    'NThreads',
+    'NThreadsBase',
+    'NThreadsNested',
+    'NThreadsNonaffine',
+    'PThreadArray',
+    'QueueID',
+    'SharedData',
+    'TBArray',
+    'ThreadArray',
+    'ThreadCommit',
+    'ThreadID',
+    'ThreadPoolSync',
+    'ThreadWait',
+]
 
 
 class NThreadsAbstract(Scalar):
@@ -55,11 +73,11 @@ class NThreadsBase(NThreadsAbstract):
         try:
             npthreads = kwargs['metadata']['npthreads']
         except KeyError:
-            raise InvalidArgument("Cannot determine `npthreads`")
+            raise InvalidArgument("Cannot determine `npthreads`") from None
 
         # If a symbolic object, it must be resolved
-        if isinstance(npthreads, NPThreads):
-            npthreads = kwargs.get(npthreads.name, npthreads.size)
+        for th in search(npthreads, NPThreads):
+            npthreads = npthreads._subs(th, kwargs.get(th.name, th.size))
 
         return {self.name: max(base_nthreads - npthreads, 1)}
 
@@ -107,8 +125,9 @@ class NPThreads(NThreadsAbstract):
             if v < self.size:
                 return {self.name: v}
             else:
-                raise InvalidArgument("Illegal `%s=%d`. It must be `%s<%d`"
-                                      % (self.name, v, self.name, self.size))
+                raise InvalidArgument(
+                    f'Illegal `{self.name}={v}`. It must be `{self.name}<{self.size}`'
+                )
         else:
             return self._arg_defaults()
 
@@ -234,10 +253,12 @@ class Lock(Array):
 
         dimensions = as_tuple(kwargs.get('dimensions'))
         if len(dimensions) != 1:
-            raise ValueError("Expected exactly one Dimension, got `%d`" % len(dimensions))
+            raise ValueError(
+                f'Expected exactly one Dimension, got `{len(dimensions)}`'
+            )
         d, = dimensions
         if not is_integer(d.symbolic_size):
-            raise ValueError("`%s` must have fixed size" % d)
+            raise ValueError(f"`{d}` must have fixed size")
         kwargs.setdefault('initvalue', np.full(d.symbolic_size, 2, dtype=np.int32))
 
         super().__init_finalize__(*args, **kwargs)
@@ -316,6 +337,38 @@ class Barrier(Fence):
 
     """
     A generic synchronization barrier for threads or processes.
+    """
+
+    pass
+
+
+class ThreadPoolSync(Barrier):
+
+    """
+    A generic synchronization barrier for a pool of threads.
+    """
+
+    pass
+
+
+class ThreadCommit(Fence):
+
+    """
+    A generic commit operation for a single thread, typically used to issue
+    a memory operation at a specific program point, which requires the special
+    treatment that all Fence subclasses provide (i.e., to avoid being reshuffled
+    around by optimization passes).
+    """
+
+    pass
+
+
+class ThreadWait(Fence):
+
+    """
+    A generic wait operation for a single thread, typically used to synchronize
+    after a memory operation issued at a specific program point with a
+    ThreadCommit operation.
     """
 
     pass

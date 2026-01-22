@@ -1,34 +1,38 @@
 from collections import namedtuple
-from ctypes import POINTER, Structure, c_int, c_ulong, c_void_p, cast, byref
-from functools import wraps, reduce
+from ctypes import POINTER, Structure, byref, c_int, c_ulong, c_void_p, cast
+from functools import cached_property, reduce, wraps
 from operator import mul
+from textwrap import dedent, wrap
 
 import numpy as np
 import sympy
-from functools import cached_property
 
 from devito.builtins import assign
-from devito.data import (DOMAIN, OWNED, HALO, NOPAD, FULL, LEFT, CENTER, RIGHT,
-                         Data, default_allocator)
+from devito.data import (
+    CENTER, DOMAIN, FULL, HALO, LEFT, NOPAD, OWNED, RIGHT, Data, default_allocator
+)
 from devito.data.allocators import DataReference
 from devito.deprecations import deprecations
 from devito.exceptions import InvalidArgument
+from devito.finite_differences import Differentiable, generate_fd_shortcuts
+from devito.finite_differences.tools import fd_weights_registry
 from devito.logger import debug, warning
 from devito.mpi import MPI
 from devito.parameters import configuration
-from devito.symbolics import FieldFromPointer, normalize_args
-from devito.finite_differences import Differentiable, generate_fd_shortcuts
-from devito.finite_differences.tools import fd_weights_registry
-from devito.tools import (ReducerMap, as_tuple, c_restrict_void_p, flatten,
-                          is_integer, memoized_meth, dtype_to_ctype, humanbytes,
-                          mpi4py_mapper)
-from devito.types.dimension import Dimension
+from devito.symbolics import FieldFromPointer, IndexedPointer, normalize_args
+from devito.tools import (
+    ReducerMap, as_tuple, c_restrict_void_p, dtype_to_ctype, flatten, humanbytes,
+    is_integer, memoized_meth, mpi4py_mapper
+)
 from devito.types.args import ArgProvider
+from devito.types.basic import AbstractFunction
 from devito.types.caching import CacheManager
-from devito.types.basic import AbstractFunction, Size
-from devito.types.utils import Buffer, DimensionTuple, NODE, CELL, host_layer, Staggering
+from devito.types.dimension import Dimension
+from devito.types.utils import (
+    CELL, NODE, Buffer, DimensionTuple, Size, Staggering, host_layer
+)
 
-__all__ = ['Function', 'TimeFunction', 'SubFunction', 'TempFunction']
+__all__ = ['Function', 'SubFunction', 'TempFunction', 'TimeFunction']
 
 
 RegionMeta = namedtuple('RegionMeta', 'offset size')
@@ -63,7 +67,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
     The type of the underlying data object.
     """
 
-    __rkwargs__ = AbstractFunction.__rkwargs__ + ('staggered', 'coefficients')
+    __rkwargs__ = AbstractFunction.__rkwargs__ + \
+        ('shape_global', 'staggered', 'coefficients')
 
     def __init_finalize__(self, *args, function=None, **kwargs):
         # Now that *all* __X_setup__ hooks have been called, we can let the
@@ -90,7 +95,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             self._data = function._data
         elif isinstance(self._allocator, DataReference):
             # Don't want to reinitialise array if DataReference used as allocator;
-            # create a no-op intialiser to avoid overwriting the original array.
+            # create a no-op initialiser to avoid overwriting the original array.
             self._initializer = lambda x: None
         elif initializer is None or callable(initializer) or self.alias:
             # Initialization postponed until the first access to .data
@@ -106,12 +111,24 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
                 # running with MPI and some processes get 0-size arrays after
                 # domain decomposition. We touch the data anyway to avoid the
                 # case `self._data is None`
-                self.data
+                _ = self.data
         else:
-            raise ValueError("`initializer` must be callable or buffer, not %s"
-                             % type(initializer))
+            raise ValueError(
+                f'`initializer` must be callable or buffer, not {type(initializer)}'
+            )
 
     _subs = Differentiable._subs
+
+    def _create_data(self):
+        if self._data is None:
+            debug(f"Allocating host memory for {self.name}{self.shape_allocated} "
+                  f"[{humanbytes(self.nbytes)}]")
+
+            self._data = self._DataType(self.shape_allocated, self.dtype,
+                                        modulo=self._mask_modulo,
+                                        allocator=self._allocator,
+                                        distributor=self._distributor,
+                                        padding=self._size_ghost)
 
     def _allocate_memory(func):
         """Allocate memory as a Data."""
@@ -122,18 +139,11 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
                     # Aliasing Functions must not allocate data
                     return
 
-                debug("Allocating host memory for %s%s [%s]"
-                      % (self.name, self.shape_allocated, humanbytes(self.nbytes)))
-
                 # Clear up both SymPy and Devito caches to drop unreachable data
                 CacheManager.clear(force=False)
 
                 # Allocate the actual data object
-                self._data = self._DataType(self.shape_allocated, self.dtype,
-                                            modulo=self._mask_modulo,
-                                            allocator=self._allocator,
-                                            distributor=self._distributor,
-                                            padding=self._size_ghost)
+                self._create_data()
 
                 # Initialize data
                 if self._first_touch:
@@ -148,7 +158,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
                         # Perhaps user only wants to initialise the physical domain
                         self._initializer(self.data)
                 else:
-                    self.data_with_halo.fill(0)
+                    self.data_with_halo[:] = 0
 
             return func(self)
         return wrapper
@@ -171,10 +181,12 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         coeffs = kwargs.get('coefficients', self._default_fd)
         if coeffs not in fd_weights_registry:
             if coeffs == 'symbolic':
-                deprecations.symbolic_warn
+                _ = deprecations.symbolic_warn
             else:
-                raise ValueError("coefficients must be one of %s"
-                                 " not %s" % (str(fd_weights_registry), coeffs))
+                raise ValueError(
+                    f'coefficients must be one of {str(fd_weights_registry)}'
+                    f' not {coeffs}'
+                )
         return coeffs
 
     @cached_property
@@ -240,7 +252,10 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         the outhalo of boundary ranks contains a number of elements depending
         on the rank position in the decomposed grid (corner, side, ...).
         """
-        return tuple(j + i + k for i, (j, k) in zip(self.shape, self._size_outhalo))
+        return tuple(
+            j + i + k
+            for i, (j, k) in zip(self.shape, self._size_outhalo, strict=True)
+        )
 
     @cached_property
     def _shape_with_inhalo(self):
@@ -255,7 +270,10 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         Typically, this property won't be used in user code, but it may come
         in handy for testing or debugging
         """
-        return tuple(j + i + k for i, (j, k) in zip(self.shape, self._halo))
+        return tuple(
+            j + i + k
+            for i, (j, k) in zip(self.shape, self._halo, strict=True)
+        )
 
     @cached_property
     def shape_allocated(self):
@@ -267,9 +285,13 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         -----
         In an MPI context, this is the *local* with_halo region shape.
         """
-        return DimensionTuple(*[j + i + k for i, (j, k) in zip(self._shape_with_inhalo,
-                                                               self._padding)],
-                              getters=self.dimensions)
+        return DimensionTuple(
+            *[
+                j + i + k
+                for i, (j, k) in zip(self._shape_with_inhalo, self._padding, strict=True)
+            ],
+            getters=self.dimensions
+        )
 
     @cached_property
     def shape_global(self):
@@ -289,14 +311,19 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         if self.grid is None:
             return self.shape
         retval = []
-        for d, s in zip(self.dimensions, self.shape):
+        for d, s in zip(self.dimensions, self.shape, strict=True):
             size = self.grid.size_map.get(d)
             retval.append(size.glb if size is not None else s)
         return tuple(retval)
 
     @property
     def symbolic_shape(self):
-        return tuple(self._C_get_field(FULL, d).size for d in self.dimensions)
+        return DimensionTuple(
+            *[
+                self._C_get_field(FULL, d).size for d in self.dimensions
+            ],
+            getters=self.dimensions
+        )
 
     @property
     def size_global(self):
@@ -324,33 +351,49 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             # and inhalo correspond
             return self._size_inhalo
 
-        left = [abs(min(i.loc_abs_min-i.glb_min-j, 0)) if i and not i.loc_empty else 0
-                for i, j in zip(self._decomposition, self._size_inhalo.left)]
-        right = [max(i.loc_abs_max+j-i.glb_max, 0) if i and not i.loc_empty else 0
-                 for i, j in zip(self._decomposition, self._size_inhalo.right)]
+        left = [
+            abs(min(i.loc_abs_min-i.glb_min-j, 0))
+            if i and not i.loc_empty else 0
+            for i, j in zip(self._decomposition, self._size_inhalo.left, strict=True)
+        ]
+        right = [
+            max(i.loc_abs_max+j-i.glb_max, 0)
+            if i and not i.loc_empty else 0
+            for i, j in zip(self._decomposition, self._size_inhalo.right, strict=True)
+        ]
 
-        sizes = tuple(Size(i, j) for i, j in zip(left, right))
+        sizes = tuple(Size(i, j) for i, j in zip(left, right, strict=True))
 
         if self._distributor.is_parallel and (any(left) or any(right)):
             try:
-                warning_msg = """A space order of {0} and a halo size of {1} has been
-                                 set but the current rank ({2}) has a domain size of
-                                 only {3}""".format(self._space_order,
-                                                    max(self._size_inhalo),
-                                                    self._distributor.myrank,
-                                                    min(self.grid.shape_local))
+                warning_msg = dedent(f"""
+                    A space order of {self._space_order} and a halo size of
+                    {max(self._size_inhalo)} has been set but the current rank
+                    ({self._distributor.myrank}) has a domain size of only
+                    {min(self.grid.shape_local)}
+                    """)[1:]
                 if not self._distributor.is_boundary_rank:
-                    warning(warning_msg)
+                    warning(' '.join(wrap(warning_msg)))
                 else:
-                    left_dist = [i for i, d in zip(left, self.dimensions) if d
-                                 in self._distributor.dimensions]
-                    right_dist = [i for i, d in zip(right, self.dimensions) if d
-                                  in self._distributor.dimensions]
-                    for i, j, k, l in zip(left_dist, right_dist,
-                                          self._distributor.mycoords,
-                                          self._distributor.topology):
+                    left_dist = [
+                        i
+                        for i, d in zip(left, self.dimensions, strict=True)
+                        if d in self._distributor.dimensions
+                    ]
+                    right_dist = [
+                        i
+                        for i, d in zip(right, self.dimensions, strict=True)
+                        if d in self._distributor.dimensions
+                    ]
+                    for i, j, k, l in zip(
+                        left_dist,
+                        right_dist,
+                        self._distributor.mycoords,
+                        self._distributor.topology,
+                        strict=False
+                    ):
                         if l > 1 and ((j > 0 and k == 0) or (i > 0 and k == l-1)):
-                            warning(warning_msg)
+                            warning(' '.join(wrap(warning_msg)))
                             break
             except AttributeError:
                 pass
@@ -369,25 +412,31 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
     @cached_property
     def _mask_modulo(self):
         """Boolean mask telling which Dimensions support modulo-indexing."""
-        return tuple(True if i.is_Stepping else False for i in self.dimensions)
+        return tuple(bool(i.is_Stepping) for i in self.dimensions)
 
     @cached_property
     def _mask_domain(self):
         """Slice-based mask to access the domain region of the allocated data."""
-        return tuple(slice(i, j) for i, j in
-                     zip(self._offset_domain, self._offset_halo.right))
+        return tuple(
+            slice(i, j)
+            for i, j in zip(self._offset_domain, self._offset_halo.right, strict=True)
+        )
 
     @cached_property
     def _mask_inhalo(self):
         """Slice-based mask to access the domain+inhalo region of the allocated data."""
-        return tuple(slice(i.left, i.right + j.right) for i, j in
-                     zip(self._offset_inhalo, self._size_inhalo))
+        return tuple(
+            slice(i.left, i.right + j.right)
+            for i, j in zip(self._offset_inhalo, self._size_inhalo, strict=True)
+        )
 
     @cached_property
     def _mask_outhalo(self):
         """Slice-based mask to access the domain+outhalo region of the allocated data."""
-        return tuple(slice(i.start - j.left, i.stop and i.stop + j.right or None)
-                     for i, j in zip(self._mask_domain, self._size_outhalo))
+        return tuple(
+            slice(i.start - j.left, i.stop and i.stop + j.right or None)
+            for i, j in zip(self._mask_domain, self._size_outhalo, strict=True)
+        )
 
     @cached_property
     def _decomposition(self):
@@ -408,8 +457,11 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         """
         if self._distributor is None:
             return (None,)*self.ndim
-        return tuple(v.reshape(*self._size_inhalo[d]) if v is not None else v
-                     for d, v in zip(self.dimensions, self._decomposition))
+        return tuple(
+            v.reshape(*self._size_inhalo[d])
+            if v is not None else v
+            for d, v in zip(self.dimensions, self._decomposition, strict=True)
+        )
 
     @property
     def data(self):
@@ -568,12 +620,12 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         data values.
         """
         self._is_halo_dirty = True
-        offset = getattr(getattr(self, '_offset_%s' % region.name)[dim], side.name)
-        size = getattr(getattr(self, '_size_%s' % region.name)[dim], side.name)
+        offset = getattr(getattr(self, f'_offset_{region.name}')[dim], side.name)
+        size = getattr(getattr(self, f'_size_{region.name}')[dim], side.name)
         index_array = [
             slice(offset, offset+size) if d is dim else slice(pl, s - pr)
             for d, s, (pl, pr)
-            in zip(self.dimensions, self.shape_allocated, self._padding)
+            in zip(self.dimensions, self.shape_allocated, self._padding, strict=True)
         ]
         return np.asarray(self._data[index_array])
 
@@ -639,8 +691,10 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         if self._distributor is None:
             return tuple(slice(0, s) for s in self.shape)
         else:
-            return tuple(self._distributor.glb_slices.get(d, slice(0, s))
-                         for s, d in zip(self.shape, self.dimensions))
+            return tuple(
+                self._distributor.glb_slices.get(d, slice(0, s))
+                for s, d in zip(self.shape, self.dimensions, strict=True)
+            )
 
     @property
     def initializer(self):
@@ -685,8 +739,10 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         dataobj._obj.nbytes = data.nbytes
 
         # MPI-related fields
-        dataobj._obj.npsize = (c_ulong*self.ndim)(*[i - sum(j) for i, j in
-                                                    zip(data.shape, self._size_padding)])
+        dataobj._obj.npsize = (c_ulong*self.ndim)(*[
+            i - sum(j)
+            for i, j in zip(data.shape, self._size_padding, strict=True)
+        ])
         dataobj._obj.dsize = (c_ulong*self.ndim)(*self._size_domain)
         dataobj._obj.hsize = (c_int*(self.ndim*2))(*flatten(self._size_halo))
         dataobj._obj.hofs = (c_int*(self.ndim*2))(*flatten(self._offset_halo))
@@ -719,7 +775,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
     @memoized_meth
     def _C_get_field(self, region, dim, side=None):
         """Symbolic representation of a given data region."""
-        ffp = lambda f, i: FieldFromPointer("%s[%d]" % (f, i), self._C_symbol)
+        ffp = lambda f, i: IndexedPointer(FieldFromPointer(f"{f}", self._C_symbol), i)
         if region is DOMAIN:
             offset = ffp(self._C_field_owned_ofs, self._C_make_index(dim, LEFT))
             size = ffp(self._C_field_domain_size, self._C_make_index(dim))
@@ -752,7 +808,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             offset = 0
             size = ffp(self._C_field_size, self._C_make_index(dim))
         else:
-            raise ValueError("Unknown region `%s`" % str(region))
+            raise ValueError(f"Unknown region `{str(region)}`")
 
         return RegionMeta(offset, size)
 
@@ -765,8 +821,8 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             # Nothing to do
             return
         if MPI.COMM_WORLD.size > 1 and self._distributor is None:
-            raise RuntimeError("`%s` cannot perform a halo exchange as it has "
-                               "no Grid attached" % self.name)
+            raise RuntimeError(f"`{self.name}` cannot perform a halo exchange as it has "
+                               "no Grid attached")
 
         neighborhood = self._distributor.neighborhood
         comm = self._distributor.comm
@@ -800,7 +856,7 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
         """Tuple of argument names introduced by this function."""
         return (self.name,)
 
-    def _arg_defaults(self, alias=None, metadata=None):
+    def _arg_defaults(self, alias=None, metadata=None, estimate_memory=False):
         """
         A map of default argument values defined by this symbol.
 
@@ -810,15 +866,19 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             To bind the argument values to different names.
         """
         key = alias or self
-        args = ReducerMap({key.name: self._data_buffer(metadata=metadata)})
+        # Avoid touching the data if just estimating memory usage
+        if estimate_memory:
+            args = ReducerMap({key.name: self})
+        else:
+            args = ReducerMap({key.name: self._data_buffer(metadata=metadata)})
 
         # Collect default dimension arguments from all indices
-        for a, i, s in zip(key.dimensions, self.dimensions, self.shape):
+        for a, i, s in zip(key.dimensions, self.dimensions, self.shape, strict=True):
             args.update(i._arg_defaults(_min=0, size=s, alias=a))
 
         return args
 
-    def _arg_values(self, metadata=None, **kwargs):
+    def _arg_values(self, metadata=None, estimate_memory=False, **kwargs):
         """
         A map of argument values after evaluating user input. If no
         user input is provided, return a default value.
@@ -834,17 +894,19 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             new = kwargs.pop(self.name)
             if isinstance(new, DiscreteFunction):
                 # Set new values and re-derive defaults
-                values = new._arg_defaults(alias=self, metadata=metadata)
+                values = new._arg_defaults(alias=self, metadata=metadata,
+                                           estimate_memory=estimate_memory)
                 values = values.reduce_all()
             else:
                 # We've been provided a pure-data replacement (array)
                 values = {self.name: new}
                 # Add value overrides for all associated dimensions
-                for i, s in zip(self.dimensions, new.shape):
+                for i, s in zip(self.dimensions, new.shape, strict=True):
                     size = s - sum(self._size_nodomain[i])
                     values.update(i._arg_defaults(size=size))
         else:
-            values = self._arg_defaults(alias=self, metadata=metadata)
+            values = self._arg_defaults(alias=self, metadata=metadata,
+                                        estimate_memory=estimate_memory)
             values = values.reduce_all()
 
         return values
@@ -859,31 +921,30 @@ class DiscreteFunction(AbstractFunction, ArgProvider, Differentiable):
             If an incompatibility is detected.
         """
         if self.name not in args:
-            raise InvalidArgument("No runtime value for `%s`" % self.name)
+            raise InvalidArgument(f"No runtime value for `{self.name}`")
 
         data = args[self.name]
 
         if len(data.shape) != self.ndim:
-            raise InvalidArgument("Shape %s of runtime value `%s` does not match "
-                                  "dimensions %s" %
-                                  (data.shape, self.name, self.dimensions))
+            raise InvalidArgument(f"Shape {data.shape} of runtime value `{self.name}` "
+                                  f"does not match dimensions {self.dimensions}")
         if data.dtype != self.dtype:
-            warning("Data type %s of runtime value `%s` does not match the "
-                    "Function data type %s" % (data.dtype, self.name, self.dtype))
+            warning(f"Data type {data.dtype} of runtime value `{self.name}` "
+                    f"does not match the Function data type {self.dtype}")
 
         # Check each Dimension for potential OOB accesses
-        for i, s in zip(self.dimensions, data.shape):
+        for i, s in zip(self.dimensions, data.shape, strict=True):
             i._arg_check(args, s, intervals[i])
 
         if args.options['index-mode'] == 'int32' and \
            args.options['linearize'] and \
            self.is_regular and \
            data.size - 1 >= np.iinfo(np.int32).max:
-            raise InvalidArgument("`%s`, with its %d elements, is too big for "
-                                  "int32 pointer arithmetic. Consider using the "
+            raise InvalidArgument(f"`{self.name}`, with its {data.size} elements, is too "
+                                  "big for int32 pointer arithmetic. Consider using the "
                                   "'index-mode=int64' option, the save=Buffer(..) "
                                   "API (TimeFunction only), or domain "
-                                  "decomposition via MPI" % (self.name, data.size))
+                                  "decomposition via MPI")
 
     def _arg_finalize(self, args, alias=None):
         key = alias or self
@@ -931,6 +992,10 @@ class Function(DiscreteFunction):
             discretization order (`o`) as well as the number of points on
             the left/right sides of a generic point of interest for each
             SpaceDimension.
+    interp_order: int, optional, default=2
+        Order of the interpolation scheme used to evaluate the Function at
+        non-grid points (e.g., when using a Function as a parameter to be
+        evaluated at a staggered location).
     shape : tuple of ints, optional
         Shape of the domain region in grid points. Only necessary if `grid`
         isn't given.
@@ -1004,7 +1069,7 @@ class Function(DiscreteFunction):
     is_autopaddable = True
 
     __rkwargs__ = (DiscreteFunction.__rkwargs__ +
-                   ('space_order', 'shape_global', 'dimensions'))
+                   ('space_order', 'interp_order', 'dimensions'))
 
     def _cache_meta(self):
         # Attach additional metadata to self's cache entry
@@ -1026,20 +1091,24 @@ class Function(DiscreteFunction):
         else:
             raise TypeError("Invalid `space_order`")
 
+        # Interpolation order
+        interp_order = kwargs.get('interp_order', 2)
+        if not is_integer(interp_order):
+            raise TypeError("`interp_order` must be an integer")
+        elif interp_order < 1:
+            raise ValueError("`interp_order` must be >= 2")
+        elif interp_order > self._space_order and self._space_order > 1:
+            raise ValueError("`interp_order` must be <= `space_order`")
+        self._interp_order = interp_order
+
         # Acquire derivative shortcuts
         if self is self.function:
             self._fd = self.__fd_setup__()
         else:
             # E.g., `self is f(x + i0, y)` and `self.function is f(x, y)`
-            # Dynamically genereating derivative shortcuts is expensive; we
+            # Dynamically generating derivative shortcuts is expensive; we
             # can clearly avoid that here though!
             self._fd = self.function._fd
-
-        # Flag whether it is a parameter or a variable.
-        # Used at operator evaluation to evaluate the Function at the
-        # variable location (i.e. if the variable is staggered in x the
-        # parameter has to be computed at x + hx/2)
-        self._is_parameter = kwargs.get('parameter', False)
 
     def __fd_setup__(self):
         """
@@ -1051,19 +1120,20 @@ class Function(DiscreteFunction):
     def _fd_priority(self):
         return 1 if self.staggered.on_node else 2
 
-    @property
-    def is_parameter(self):
-        return self._is_parameter
-
     def _eval_at(self, func):
-        if not self.is_parameter or self.staggered == func.staggered:
+        if self.staggered == func.staggered:
             return self
-        mapper = {self.indices_ref[d]: func.indices_ref[d]
-                  for d in self.dimensions
-                  if self.indices_ref[d] is not func.indices_ref[d]}
-        if mapper:
-            return self.subs(mapper)
-        return self
+
+        mapper = {}
+        for d in self.dimensions:
+            try:
+                if self.indices_ref[d] is not func.indices_ref[d]:
+                    f_idx = func.indices_ref[d]._subs(func.dimensions[d], d)
+                    mapper[self.indices_ref[d]] = f_idx
+            except KeyError:
+                pass
+
+        return self.subs(mapper)
 
     @classmethod
     def __staggered_setup__(cls, dimensions, staggered=None, **kwargs):
@@ -1114,8 +1184,10 @@ class Function(DiscreteFunction):
             if not staggered:
                 staggered_indices = dimensions
             else:
-                staggered_indices = (d + i * d.spacing / 2
-                                     for d, i in zip(dimensions, staggered))
+                staggered_indices = (
+                    d + i * d.spacing / 2
+                    for d, i in zip(dimensions, staggered, strict=True)
+                )
         return tuple(dimensions), tuple(staggered_indices)
 
     @property
@@ -1150,13 +1222,12 @@ class Function(DiscreteFunction):
                 raise ValueError("`shape` and `dimensions` must have the "
                                  "same number of entries")
             loc_shape = []
-            for d, s in zip(dimensions, shape):
+            for d, s in zip(dimensions, shape, strict=True):
                 if d in grid.dimensions:
                     size = grid.size_map[d]
                     if size.glb != s and s is not None:
-                        raise ValueError("Dimension `%s` is given size `%d`, "
-                                         "while `grid` says `%s` has size `%d` "
-                                         % (d, s, d, size.glb))
+                        raise ValueError(f"Dimension `{d}` is given size `{s}`, "
+                                         f"while `grid` says `{d}` has size `{size.glb}`")
                     else:
                         loc_shape.append(size.loc)
                 else:
@@ -1216,13 +1287,18 @@ class Function(DiscreteFunction):
             padding = tuple((0, i) if is_integer(i) else i for i in padding)
 
         else:
-            raise TypeError("`padding` must be int or %d-tuple of ints" % self.ndim)
+            raise TypeError(f"`padding` must be int or {self.ndim}-tuple of ints")
         return DimensionTuple(*padding, getters=self.dimensions)
 
     @property
     def space_order(self):
         """The space order."""
         return self._space_order
+
+    @property
+    def interp_order(self):
+        """The interpolation order."""
+        return self._interp_order
 
     def sum(self, p=None, dims=None):
         """
@@ -1453,7 +1529,7 @@ class TimeFunction(Function):
             elif is_integer(save):
                 shape.insert(cls._time_position, save)
             else:
-                raise TypeError("`save` can be None, int or Buffer, not %s" % type(save))
+                raise TypeError(f"`save` can be None, int or Buffer, not {type(save)}")
         elif dimensions is None:
             raise TypeError("`dimensions` required if both `grid` and "
                             "`shape` are provided")
@@ -1512,14 +1588,22 @@ class TimeFunction(Function):
     def _time_buffering_default(self):
         return self._time_buffering and not isinstance(self.save, Buffer)
 
+    def _evaluate(self, **kwargs):
+        retval = super()._evaluate(**kwargs)
+        if not self._time_buffering and not retval.is_Function:
+            # Saved TimeFunction might need streaming, expand interpolations
+            # for easier processing
+            return retval.evaluate
+        else:
+            return retval
+
     def _arg_check(self, args, intervals, **kwargs):
         super()._arg_check(args, intervals, **kwargs)
 
         key_time_size = args[self.name].shape[self._time_position]
         if self._time_buffering and self._time_size != key_time_size:
-            raise InvalidArgument("Expected `time_size=%d` for runtime "
-                                  "value `%s`, found `%d` instead"
-                                  % (self._time_size, self.name, key_time_size))
+            raise InvalidArgument(f"Expected `time_size={self._time_size}` for runtime "
+                                  f"value `{self.name}`, found `{key_time_size}` instead")
 
 
 class SubFunction(Function):
@@ -1548,8 +1632,8 @@ class SubFunction(Function):
         if self._parent is not None and self.parent.name not in kwargs:
             return self._parent._arg_defaults(alias=self._parent).reduce_all()
         elif self.name in kwargs:
-            raise RuntimeError("`%s` is a SubFunction, so it can't be assigned "
-                               "a value dynamically" % self.name)
+            raise RuntimeError(f"`{self.name}` is a SubFunction, so it can't be assigned "
+                               "a value dynamically")
         else:
             return self._arg_defaults(alias=self)
 
@@ -1659,7 +1743,7 @@ class TempFunction(DiscreteFunction):
     def shape_with_halo(self):
         domain = self.shape
         halo = [sympy.Add(*i, evaluate=False) for i in self._size_halo]
-        ret = tuple(sum(i) for i in zip(domain, halo))
+        ret = tuple(sum(i) for i in zip(domain, halo, strict=True))
         return DimensionTuple(*ret, getters=self.dimensions)
 
     shape_allocated = AbstractFunction.symbolic_shape
@@ -1693,22 +1777,22 @@ class TempFunction(DiscreteFunction):
             for n, i in enumerate(self.shape):
                 v = i.subs(args)
                 if not v.is_Integer:
-                    raise ValueError("Couldn't resolve `shape[%d]=%s` with the given "
-                                     "kwargs (obtained: `%s`)" % (n, i, v))
+                    raise ValueError(f"Couldn't resolve `shape[{n}]={i}` with the given "
+                                     f"kwargs (obtained: `{v}`)")
                 shape.append(int(v))
             shape = tuple(shape)
         elif len(shape) != self.ndim:
-            raise ValueError("`shape` must contain %d integers, not %d"
-                             % (self.ndim, len(shape)))
+            raise ValueError(f"`shape` must contain {self.ndim} integers, "
+                             f"not {len(shape)}")
         elif not all(is_integer(i) for i in shape):
-            raise ValueError("`shape` must contain integers (got `%s`)" % str(shape))
+            raise ValueError(f"`shape` must contain integers (got `{str(shape)}`)")
 
         return Function(name=self.name, dtype=self.dtype, dimensions=self.dimensions,
                         shape=shape, halo=self.halo, initializer=initializer,
                         allocator=allocator)
 
     def _make_pointer(self, dim):
-        return TempFunction(name='p%s' % self.name, dtype=self.dtype, pointer_dim=dim,
+        return TempFunction(name=f'p{self.name}', dtype=self.dtype, pointer_dim=dim,
                             dimensions=self.dimensions, halo=self.halo)
 
     def _arg_defaults(self, alias=None):
@@ -1721,6 +1805,6 @@ class TempFunction(DiscreteFunction):
                 # Set new values and re-derive defaults
                 return new._arg_defaults().reduce_all()
             else:
-                raise InvalidArgument("Illegal runtime value for `%s`" % self.name)
+                raise InvalidArgument(f"Illegal runtime value for `{self.name}`")
         else:
-            raise InvalidArgument("TempFunction `%s` lacks override" % self.name)
+            raise InvalidArgument(f"TempFunction `{self.name}` lacks override")

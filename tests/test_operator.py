@@ -1,28 +1,43 @@
+import json
+import logging
+import os
+from functools import reduce
 from itertools import permutations
+from operator import mul
 
 import numpy as np
+import pytest
 import sympy
 
-import pytest
-from conftest import assert_structure, skipif
-from devito import (Grid, Eq, Operator, Constant, Function, TimeFunction,
-                    SparseFunction, SparseTimeFunction, Dimension, error, SpaceDimension,
-                    NODE, CELL, dimensions, configuration, TensorFunction,
-                    TensorTimeFunction, VectorFunction, VectorTimeFunction,
-                    div, grad, switchconfig, exp)
-from devito import  Inc, Le, Lt, Ge, Gt  # noqa
+# Try-except required to allow for import of classes from this file
+# for testing in PRO
+try:
+    from ..conftest import assert_structure, skipif
+except ImportError:
+    from conftest import assert_structure, skipif
+
+from devito import (  # noqa
+    CELL, NODE, Buffer, Constant, Dimension, Eq, Function, Ge, Grid, Gt, Inc, Le, Lt,
+    Operator, SpaceDimension, SparseFunction, SparseTimeFunction, TensorFunction,
+    TensorTimeFunction, TimeFunction, VectorFunction, VectorTimeFunction, configuration,
+    dimensions, div, error, exp, grad, sin, switchconfig
+)
+from devito.arch.archinfo import Device
 from devito.exceptions import InvalidOperator
 from devito.finite_differences.differentiable import diff2sympy
 from devito.ir.equations import ClusterizedEq
 from devito.ir.equations.algorithms import lower_exprs
-from devito.ir.iet import (Callable, Conditional, Expression, Iteration, TimedList,
-                           FindNodes, IsPerfectIteration, retrieve_iteration_tree,
-                           FindSymbols)
+from devito.ir.iet import (
+    Callable, Conditional, Expression, FindNodes, FindSymbols, IsPerfectIteration,
+    Iteration, TimedList, retrieve_iteration_tree
+)
 from devito.ir.support import Any, Backward, Forward
 from devito.passes.iet.languages.C import CDataManager
 from devito.symbolics import ListInitializer, indexify, retrieve_indexed
 from devito.tools import flatten, powerset, timed_region
-from devito.types import Array, Barrier, CustomDimension, Indirection, Scalar, Symbol
+from devito.types import (
+    Array, Barrier, ConditionalDimension, CustomDimension, Indirection, Scalar, Symbol
+)
 
 
 def dimify(dimensions):
@@ -54,7 +69,7 @@ class TestOperatorSetup:
         # Unrecognised platform name -> exception
         try:
             Operator(Eq(u, u + 1), platform='asga')
-            assert False
+            raise AssertionError('Assert False')
         except InvalidOperator:
             assert True
 
@@ -78,7 +93,7 @@ class TestOperatorSetup:
         # ... but it will raise an exception if an unknown one
         try:
             Operator(Eq(u, u + 1), platform='nvidiaX', compiler='asf')
-            assert False
+            raise AssertionError('Assert False')
         except InvalidOperator:
             assert True
 
@@ -92,7 +107,7 @@ class TestOperatorSetup:
         # Unsupported combination of `platform` and `language` should throw an error
         try:
             Operator(Eq(u, u + 1), platform='bdw', language='openacc')
-            assert False
+            raise AssertionError('Assert False')
         except InvalidOperator:
             assert True
 
@@ -108,14 +123,14 @@ class TestOperatorSetup:
         # Unknown pass
         try:
             Operator(Eq(u, u + 1), opt=('aaa'))
-            assert False
+            raise AssertionError('Assert False')
         except InvalidOperator:
             assert True
 
         # Unknown optimization option
         try:
             Operator(Eq(u, u + 1), opt=('advanced', {'aaa': 1}))
-            assert False
+            raise AssertionError('Assert False')
         except InvalidOperator:
             assert True
 
@@ -287,7 +302,7 @@ class TestCodeGen:
             ompreg = timedlist.body[0]
             assert ompreg.body[0].dim is grid.time_dim
         else:
-            timedlist.body[0].dim is grid.time_dim
+            timedlist.body[0].dim is grid.time_dim  # noqa: B015
 
     def test_nested_lowering(self):
         """
@@ -622,7 +637,7 @@ class TestArithmetic:
 
     def test_sparsetimefunction_inject_dt(self):
         """
-        Test injection of the time deivative of a SparseTimeFunction into a TimeFunction
+        Test injection of the time derivative of a SparseTimeFunction into a TimeFunction
         """
         grid = Grid(shape=(11, 11))
         u = TimeFunction(name='u', grid=grid, time_order=2, save=5, space_order=1)
@@ -746,8 +761,7 @@ class TestApplyArguments:
                 condition = arguments[name] == v
 
             if not condition:
-                error('Wrong argument %s: expected %s, got %s' %
-                      (name, v, arguments[name]))
+                error(f'Wrong argument {name}: expected {v}, got {arguments[name]}')
             assert condition
 
     def verify_parameters(self, parameters, expected):
@@ -759,11 +773,11 @@ class TestApplyArguments:
         parameters = [p.name for p in parameters]
         for expi in expected:
             if expi not in parameters + boilerplate:
-                error("Missing parameter: %s" % expi)
+                error(f"Missing parameter: {expi}")
             assert expi in parameters + boilerplate
         extra = [p for p in parameters if p not in expected and p not in boilerplate]
         if len(extra) > 0:
-            error("Redundant parameters: %s" % str(extra))
+            error(f"Redundant parameters: {str(extra)}")
         assert len(extra) == 0
 
     def test_default_functions(self):
@@ -994,12 +1008,12 @@ class TestApplyArguments:
         one.data[:] = 1.
         op = Operator(Eq(a.forward, a + one))
 
-        # Test dimension override via the buffered dimenions
+        # Test dimension override via the buffered dimensions
         a.data[0] = 0.
         op(a=a, t=5)
         assert(np.allclose(a.data[1], 5.))
 
-        # Test dimension override via the parent dimenions
+        # Test dimension override via the parent dimensions
         a.data[0] = 0.
         op(a=a, time=4)
         assert(np.allclose(a.data[0], 4.))
@@ -1058,7 +1072,7 @@ class TestApplyArguments:
 
     def test_argument_derivation_order(self, nt=100):
         """ Ensure the precedence order of arguments is respected
-        Defaults < (overriden by) Tensor Arguments < Dimensions < Scalar Arguments
+        Defaults < (overridden by) Tensor Arguments < Dimensions < Scalar Arguments
         """
         i, j, k = dimify('i j k')
         shape = (10, 10, 10)
@@ -1158,7 +1172,7 @@ class TestApplyArguments:
         op = Operator(Eq(a, a + a))
         try:
             op.apply(b=3)
-            assert False
+            raise AssertionError('Assert False')
         except ValueError:
             # `b` means nothing to `op`, so we end up here
             assert True
@@ -1167,9 +1181,9 @@ class TestApplyArguments:
             configuration['ignore-unknowns'] = True
             op.apply(b=3)
             assert True
-        except ValueError:
+        except ValueError as e:
             # we should not end up here as we're now ignoring unknown arguments
-            assert False
+            raise AssertionError('Assert False') from e
         finally:
             configuration['ignore-unknowns'] = configuration._defaults['ignore-unknowns']
 
@@ -1211,11 +1225,11 @@ class TestApplyArguments:
 
         try:
             op.apply(a=a1, b=b0)
-            assert False
+            raise AssertionError('Assert False')
         except ValueError as e:
             assert 'Override' in e.args[0]  # Check it's hitting the right error msg
-        except:
-            assert False
+        except Exception as e:
+            raise AssertionError('Assert False') from e
 
     def test_incomplete_override(self):
         """
@@ -1234,11 +1248,11 @@ class TestApplyArguments:
 
         try:
             op.apply(a=a1)
-            assert False
+            raise AssertionError('Assert False')
         except ValueError as e:
             assert 'Default' in e.args[0]  # Check it's hitting the right error msg
-        except:
-            assert False
+        except Exception as e:
+            raise AssertionError('Assert False') from e
 
     @pytest.mark.parallel(mode=1)
     def test_new_distributor(self, mode):
@@ -1618,7 +1632,10 @@ class TestLoopScheduling:
         assert "".join(mapper.get(i.dim.name, i.dim.name) for i in iters) == visit
         # mapper just makes it quicker to write out the test parametrization
         mapper = {'+': Forward, '-': Backward, '*': Any}
-        assert all(i.direction == mapper[j] for i, j in zip(iters, directions))
+        assert all(
+            i.direction == mapper[j]
+            for i, j in zip(iters, directions, strict=True)
+        )
 
     def test_expressions_imperfect_loops(self):
         """
@@ -1735,7 +1752,10 @@ class TestLoopScheduling:
                     Eq(b, time*b*a + b)]
             eqns2 = [Eq(a.forward, a.laplace + 1.),
                      Eq(b2, time*b2*a + b2)]
-            subs = {d.spacing: v for d, v in zip(dims0, [2.5, 1.5, 2.0][:grid.dim])}
+            subs = {
+                d.spacing: v
+                for d, v in zip(dims0, [2.5, 1.5, 2.0][:grid.dim], strict=True)
+            }
 
             op = Operator(eqns, subs=subs, opt='noop')
             trees = retrieve_iteration_tree(op)
@@ -2021,6 +2041,23 @@ class TestLoopScheduling:
         op.apply()
         assert(np.all(u.data[:] == expected[:]))
 
+    def test_pseudo_time_dep(self):
+        """
+        Test that a data dependency through a field is correctly
+        ignored when not direction dependent
+        """
+        grid = Grid((11, 11))
+        ct = ConditionalDimension(name='ct', parent=grid.time_dim, factor=2)
+        f = TimeFunction(name='f', grid=grid, time_order=1)
+        g = Function(name='g', grid=grid)
+
+        eq = [Eq(f.backward, div(f) + 1),
+              Eq(g, g + f.symbolic_shape[1], implicit_dims=ct),
+              Eq(g, g + 1, implicit_dims=ct)]
+        op = Operator(eq)
+
+        assert_structure(op, ['t,x,y', 't', 't,x,y'], 't,x,y,x,y')
+
 
 class TestInternals:
 
@@ -2051,3 +2088,231 @@ class TestInternals:
 
         assert np.all(f.data[0] == 0.)
         assert np.all(f.data[i] == 3. for i in range(1, 10))
+
+
+class TestEstimateMemory:
+    """Tests for the Operator.estimate_memory() utility"""
+
+    _array_temp = "r0L0(" if "CXX" in configuration['language'] else "r0["
+
+    def parse_output(self, summary, check, arrays=0):
+        device = isinstance(configuration['platform'], Device)
+        expected = ((check, check + arrays) if device else (check + arrays, 0))
+        assert (summary['host'], summary['device']) == expected
+
+    def sum_sizes(self, funcs):
+        return sum(func.size_allocated*np.dtype(func.dtype).itemsize
+                   for func in funcs)
+
+    @pytest.mark.parametrize('shape', [(11,), (101, 101), (101, 101, 101)])
+    @pytest.mark.parametrize('dtype', [np.int8, np.int16, np.float32,
+                                       np.float32, np.complex64])
+    @pytest.mark.parametrize('so', [0, 2, 4, 6])
+    def test_basic_usage(self, caplog, shape, dtype, so):
+        grid = Grid(shape=shape)
+        f = Function(name='f', grid=grid, space_order=so, dtype=dtype)
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator(Eq(f, 1))
+
+            summary = op.estimate_memory()
+            # Check that no allocation occurs as estimate_memory should avoid data touch
+            assert "Allocating" not in caplog.text
+
+            # Check output of estimate_memory
+            host = reduce(mul, f.shape_allocated)*np.dtype(f.dtype).itemsize
+            self.parse_output(summary, host)
+
+    def test_multiple_objects(self, caplog):
+        grid = Grid(shape=(101, 101))
+
+        f = Function(name='f', grid=grid, space_order=2, dtype=np.float32)
+        g = Function(name='g', grid=grid, space_order=4, dtype=np.float64)
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator([Eq(f, 1), Eq(g, 1)])
+            summary = op.estimate_memory()
+            assert "Allocating" not in caplog.text
+
+            check = self.sum_sizes((f, g))
+            self.parse_output(summary, check)
+
+    @pytest.mark.parametrize('time', [True, False])
+    def test_sparse(self, caplog, time):
+        grid = Grid(shape=(101, 101))
+        f = Function(name='f', grid=grid, space_order=2)
+        if time:
+            src = SparseTimeFunction(name='src', grid=grid, npoint=1000, nt=10)
+        else:
+            src = SparseFunction(name='src', grid=grid, npoint=1000)
+        src_term = src.inject(field=f, expr=src)
+
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator(src_term)
+            summary = op.estimate_memory()
+            assert "Allocating" not in caplog.text
+
+            check = self.sum_sizes((f, src, src.coordinates))
+            self.parse_output(summary, check)
+
+    @pytest.mark.parametrize('save', [None, Buffer(3), 10])
+    def test_timefunction(self, caplog, save):
+        grid = Grid(shape=(101, 101))
+        f = Function(name='f', grid=grid, space_order=2, save=save)
+
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator(Eq(f, 1))
+            summary = op.estimate_memory()
+            assert "Allocating" not in caplog.text
+            check = reduce(mul, f.shape_allocated)*np.dtype(f.dtype).itemsize
+            self.parse_output(summary, check)
+
+    def test_mashup(self, caplog):
+        grid = Grid(shape=(101, 101))
+        f = Function(name='f', grid=grid, space_order=4)
+        g = TimeFunction(name='g', grid=grid, space_order=4)
+
+        src0 = SparseFunction(name='src0', grid=grid, npoint=100)
+        src1 = SparseFunction(name='src1', grid=grid, npoint=100)
+
+        eq0 = Eq(f, 1)
+        eq1 = Eq(g, 1)
+
+        src_term0 = src0.inject(field=f, expr=src0)
+        src_term1 = src1.inject(field=f, expr=src1)
+
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator([eq0, eq1] + src_term0 + src_term1)
+            summary = op.estimate_memory()
+            assert "Allocating" not in caplog.text
+
+            check = self.sum_sizes((f, g, src0, src0.coordinates, src1, src1.coordinates))
+            self.parse_output(summary, check)
+
+    @pytest.mark.parametrize('override', [True, False])
+    def test_temp_array(self, caplog, override):
+        """Check that temporary arrays will be factored into the memory calculation"""
+        grid = Grid(shape=(101, 101))
+        f = TimeFunction(name='f', grid=grid, space_order=2)
+        g = TimeFunction(name='g', grid=grid, space_order=2)
+        a = Function(name='a', grid=grid, space_order=2)
+
+        if override:
+            grid0 = Grid(shape=(51, 51))
+            f0 = TimeFunction(name='f0', grid=grid0, space_order=2)
+            g0 = TimeFunction(name='g0', grid=grid0, space_order=2)
+            a0 = Function(name='a0', grid=grid0, space_order=2)
+            funcs = (f0, g0, a0)
+            kwargs = {'f': f0, 'g': g0, 'a': a0}
+
+            # Fake array allocated in Python land so that shape_allocated can be used
+            b = Function(name='b', grid=grid0, space_order=0)
+        else:
+            funcs = (f, g, a)
+            kwargs = {}
+            b = Function(name='b', grid=grid, space_order=0)
+
+        # Reuse an expensive function to encourage generation of an array temp
+        eq0 = Eq(f.forward, g + sin(a).dx)
+        eq1 = Eq(g.forward, f + sin(a).dx)
+
+        # Ensure the same behavior (and thus honours legacy) irrespective of the
+        # Operator.CIRE_MINMEM value
+        opt = ('advanced', {'cire-minmem': True})
+
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator([eq0, eq1], opt=opt)
+
+            # Regression to ensure this test functions as intended
+            # Ensure an array temporary is created
+            assert self._array_temp in str(op.ccode)
+
+            summary = op.estimate_memory(**kwargs)
+            assert "Allocating" not in caplog.text
+
+            check = self.sum_sizes(funcs)
+
+            # Factor in the temp array
+            # Note: temp array size is incremented by one in the x dimension
+            # due to derivative.
+            array_check = (b.shape_allocated[0]+1)*b.shape_allocated[1]
+            array_check *= np.dtype(b.dtype).itemsize
+            self.parse_output(summary, check, arrays=array_check)
+
+    def test_overrides(self, caplog):
+        def setup(size, npoint, nt, counter):
+            grid = Grid(shape=(size, size))
+            # Original fields
+            f = Function(name=f'f{counter}', grid=grid, space_order=4)
+            tf = TimeFunction(name=f'tf{counter}', grid=grid, space_order=4)
+            s = SparseFunction(name=f's{counter}', grid=grid, npoint=npoint)
+            st = SparseTimeFunction(name=f'st{counter}', grid=grid, npoint=npoint, nt=nt)
+
+            return f, tf, s, st
+
+        # Original fields
+        f0, tf0, s0, st0 = setup(101, 100, 10, 0)
+        # Replacement fields with bigger grid, etc
+        f1, tf1, s1, st1 = setup(201, 200, 20, 1)
+        # Replacement fields with smaller grid, etc
+        f2, tf2, s2, st2 = setup(51, 50, 5, 2)
+
+        eq0 = Eq(f0, 1)
+        eq1 = Eq(tf0, 1)
+        s0_term = s0.inject(field=f0, expr=s0)
+        st0_term = st0.inject(field=tf0, expr=st0)
+
+        with switchconfig(log_level='DEBUG'), caplog.at_level(logging.DEBUG):
+            op = Operator([eq0, eq1] + s0_term + st0_term)
+
+            # Apply overrides for the check
+            summary0 = op.estimate_memory(f0=f1, tf0=tf1, s0=s1, st0=st1)
+
+            check0 = self.sum_sizes((f1, tf1, s1, s1.coordinates, st1, st1.coordinates))
+            self.parse_output(summary0, check0)
+
+            # Check with a second set of overrides
+            summary1 = op.estimate_memory(f0=f2, tf0=tf2, s0=s2, st0=st2)
+            assert "Allocating" not in caplog.text
+
+            check1 = self.sum_sizes((f2, tf2, s2, s2.coordinates, st2, st2.coordinates))
+            self.parse_output(summary1, check1)
+
+    def test_device(self, caplog):
+        # Note: this uses switchconfig and runs on all backends to reflect expected
+        # usage: users are likely to run the estimate on the orchestration node which
+        # may not have the intended hardware, before using this output to determine which
+        # nodes to farm jobs out to.
+        grid = Grid(shape=(101, 101))
+
+        f = Function(name='f', grid=grid, space_order=2)
+
+        # Compiler is never invoked, so this is fine
+        config = {'log_level': 'DEBUG', 'language': 'openacc',
+                  'platform': 'nvidiaX'}
+        with switchconfig(**config), caplog.at_level(logging.DEBUG):
+            op = Operator(Eq(f, 1))
+
+            summary = op.estimate_memory()
+            assert "Allocating" not in caplog.text
+
+            check = reduce(mul, f.shape_allocated)*np.dtype(f.dtype).itemsize
+
+            # Matching memory allocated both on host and device for memmap
+            self.parse_output(summary, check)
+
+    def test_to_json(self):
+        grid = Grid(shape=(101, 101))
+        f = Function(name='f', grid=grid, space_order=2)
+        op = Operator(Eq(f, 1))
+        summary = op.estimate_memory()
+
+        summary.to_json("memory_estimate_output.json")
+
+        with open("memory_estimate_output.json") as infile:
+            json_object = json.load(infile)
+
+            assert json_object['name'] == summary.name
+            assert json_object['host'] == summary['host']
+            assert json_object['device'] == summary['device']
+
+        # Clean up
+        os.remove("memory_estimate_output.json")

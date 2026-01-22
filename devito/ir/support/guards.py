@@ -4,18 +4,38 @@ of the compiler to express the conditions under which a certain object
 (e.g., Eq, Cluster, ...) should be evaluated at runtime.
 """
 
-from sympy import And, Ge, Gt, Le, Lt, Mul, true
+from collections import Counter, defaultdict
+from functools import singledispatch
+from operator import ge, gt, le, lt
+
+import numpy as np
+from sympy import And, Expr, Ge, Gt, Le, Lt, Mul, true
+from sympy.logic.boolalg import BooleanFunction
 
 from devito.ir.support.space import Forward, IterationDirection
-from devito.symbolics import CondEq, CondNe
+from devito.symbolics import CondEq, CondNe, search
 from devito.tools import Pickable, as_tuple, frozendict, split
-from devito.types import Dimension
+from devito.types import Dimension, LocalObject
 
-__all__ = ['GuardFactor', 'GuardBound', 'GuardBoundNext', 'BaseGuardBound',
-           'BaseGuardBoundNext', 'GuardOverflow', 'Guards']
+__all__ = [
+    'BaseGuardBound',
+    'BaseGuardBoundNext',
+    'GuardBound',
+    'GuardBoundNext',
+    'GuardCaseSwitch',
+    'GuardExpr',
+    'GuardFactor',
+    'GuardOverflow',
+    'GuardSwitch',
+    'Guards',
+]
 
 
-class Guard:
+class AbstractGuard:
+    pass
+
+
+class Guard(AbstractGuard):
 
     @property
     def _args_rebuild(self):
@@ -211,6 +231,35 @@ negations = {
 }
 
 
+class GuardSwitch(AbstractGuard, Expr):
+
+    """
+    A switch guard (akin to C's switch-case) that can be used to select
+    between multiple cases at runtime.
+    """
+
+    def __new__(cls, arg, **kwargs):
+        return Expr.__new__(cls, arg)
+
+    @property
+    def arg(self):
+        return self.args[0]
+
+
+class GuardCaseSwitch(GuardSwitch):
+
+    """
+    A case within a GuardSwitch.
+    """
+
+    def __new__(cls, arg, case, **kwargs):
+        return Expr.__new__(cls, arg, case)
+
+    @property
+    def case(self):
+        return self.args[1]
+
+
 class Guards(frozendict):
 
     """
@@ -249,6 +298,21 @@ class Guards(frozendict):
 
         return Guards(m)
 
+    def pairwise_or(self, d, *guards):
+        m = dict(self)
+        guards = list(guards)
+
+        if d in m:
+            guards.append(m[d])
+
+        g = pairwise_or(*guards)
+        if g is true:
+            m.pop(d, None)
+        else:
+            m[d] = g
+
+        return Guards(m)
+
     def impose(self, d, guard):
         m = dict(self)
 
@@ -272,8 +336,69 @@ class Guards(frozendict):
 
         return Guards(m)
 
+    def as_map(self, d, cls):
+        if cls not in (Le, Lt, Ge, Gt):
+            raise ValueError(f"Unsupported class {cls}")
+
+        return dict(i.args for i in search(self.get(d), cls))
+
+
+class GuardExpr(LocalObject, BooleanFunction):
+
+    """
+    A boolean symbol that can be used as a guard. As such, it can be chained
+    with other relations using the standard boolean operators (&, |, ...).
+
+    Being a LocalObject, a GuardExpr may carry an `initvalue`, which is
+    the value that the guard assumes at the beginning of the scope where
+    it is defined.
+    """
+
+    dtype = np.bool
+
+    def __init__(self, name, liveness='eager', **kwargs):
+        super().__init__(name, liveness=liveness, **kwargs)
+
+    @singledispatch
+    def _handle_boolean(obj, mapper):
+        raise NotImplementedError(f"Cannot handle boolean of type {type(obj)}")
+
+    @_handle_boolean.register(And)
+    def _(obj, mapper):
+        for a in obj.args:
+            GuardExpr._handle_boolean(a, mapper)
+
+    @_handle_boolean.register(Le)
+    @_handle_boolean.register(Ge)
+    @_handle_boolean.register(Lt)
+    @_handle_boolean.register(Gt)
+    def _(obj, mapper):
+        d, v = obj.args
+        k = obj.__class__
+        mapper.setdefault(k, {})[d] = v
+
+    @property
+    def as_mapper(self):
+        mapper = {}
+        GuardExpr._handle_boolean(self.initvalue, mapper)
+        return frozendict(mapper)
+
+    def sort_key(self, order=None):
+        # Use the overarching LocalObject name for arguments ordering
+        class_key, args, exp, coeff = super().sort_key(order=order)
+        args = (len(args[1]) + 1, (self.name,) + args[1])
+        return class_key, args, exp, coeff
+
 
 # *** Utils
+
+op_mapper = {
+    Le: le,
+    Lt: lt,
+    Ge: ge,
+    Gt: gt
+}
+
 
 def simplify_and(relation, v):
     """
@@ -294,12 +419,45 @@ def simplify_and(relation, v):
     covered = False
     new_args = []
     for a in candidates:
-        if a.lhs is v.lhs:
+        if isinstance(v, GuardExpr) and isinstance(a, GuardExpr):
+            # Attempt optimizing guards in GuardExpr form
             covered = True
-            try:
-                if type(a) in (Gt, Ge) and v.rhs > a.rhs:
+
+            m0 = v.as_mapper
+            m1 = a.as_mapper
+
+            for cls, op in op_mapper.items():
+                if cls in m0 and cls in m1:
+                    try:
+                        if set(m0[cls]) != set(m1[cls]):
+                            new_args.extend([a, v])
+                        elif all(op(m0[cls][d], m1[cls][d]) for d in m0[cls]):
+                            new_args.append(v)
+                        elif all(op(m1[cls][d], m0[cls][d]) for d in m1[cls]):
+                            new_args.append(a)
+                        else:
+                            new_args.extend([a, v])
+                    except TypeError:
+                        # E.g., `cls = Le`, then `z <= 2` and `z <= z_M + 1`
+                        new_args.extend([a, v])
+
+                elif cls in m0:
                     new_args.append(v)
-                elif type(a) in (Lt, Le) and v.rhs < a.rhs:
+
+                elif cls in m1:
+                    new_args.append(a)
+
+        elif a.lhs is not v.lhs:
+            new_args.append(a)
+
+        else:
+            # Attempt optimizing guards in relational form
+            covered = True
+
+            try:
+                if type(a) in (Gt, Ge) \
+                        and v.rhs > a.rhs or type(a) in (Lt, Le) \
+                        and v.rhs < a.rhs:
                     new_args.append(v)
                 else:
                     new_args.append(a)
@@ -307,9 +465,77 @@ def simplify_and(relation, v):
                 # E.g., `v.rhs = const + z_M` and `a.rhs = z_M`, so the inequalities
                 # above are not evaluable to True/False
                 new_args.append(a)
-        else:
-            new_args.append(a)
+
     if not covered:
         new_args.append(v)
 
     return And(*(new_args + other))
+
+
+def pairwise_or(*guards):
+    """
+    Given a series of guards, create a new guard that combines them by taking
+    the OR of each subset of homogeneous components. Here, "homogeneous" means
+    that they apply to the same variable with the same operator (e.g., given
+    `y >= 2`, `y >= 3` is homogeneous, while `z >= 3` and `y <= 4` are not).
+
+    Examples
+    --------
+    Given:
+
+        g0 = {flag0 and z >= 2 and z <= 10 and y >= 3}
+        g1 = {z >= 4 and z <= 8}
+        g2 = {y >= 2 and y <= 5}
+
+    Where `flag0` is of type GuardExpr, then:
+
+    Return:
+
+        {z >= 2 and z <= 10 and y >= 2}
+    """
+    errmsg = lambda g: f"Cannot handle guard component of type {type(g)}"
+
+    flags = Counter()
+    mapper = defaultdict(list)
+
+    # Analysis
+    for guard in guards:
+        if guard is true or guard is None:
+            continue
+        elif isinstance(guard, And):
+            components = guard.args
+        elif isinstance(guard, GuardExpr) or guard.is_Relational:
+            components = [guard]
+        else:
+            raise NotImplementedError(errmsg(guard))
+
+        for g in components:
+            if isinstance(g, GuardExpr):
+                flags[g] += 1
+            elif g.is_Relational and g.lhs.is_Symbol and g.rhs.is_Number:
+                mapper[(g.lhs, type(g))].append(g.rhs)
+            else:
+                raise NotImplementedError(errmsg(g))
+
+    # Synthesis
+    guard = true
+    for (s, op), v in mapper.items():
+        if len(v) < len(guards):
+            # Not all guards contributed to this component; cannot simplify
+            pass
+        elif op in (Ge, Gt):
+            guard = And(guard, op(s, min(v)))
+        else:
+            guard = And(guard, op(s, max(v)))
+
+    for flag, v in flags.items():
+        if v == len(guards):
+            guard = And(guard, flag)
+        elif flag.initvalue.free_symbols & guard.free_symbols:
+            # We still lack the logic to properly handle this case
+            raise NotImplementedError(errmsg(flag))
+        else:
+            # Safe to ignore
+            pass
+
+    return guard

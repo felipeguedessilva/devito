@@ -1,18 +1,20 @@
 from collections import defaultdict
 from collections.abc import Iterable
+from contextlib import suppress
 from functools import cached_property
 from itertools import chain
 
 import sympy
 
-from .finite_difference import generic_derivative, cross_derivative
-from .differentiable import Differentiable, diffify, interp_for_fd, Add, Mul
-from .tools import direct, transpose
-from .rsfd import d45
-from devito.tools import (as_mapper, as_tuple, frozendict, is_integer,
-                          Pickable)
+from devito.tools import Pickable, as_mapper, as_tuple, frozendict, is_integer
+from devito.types.dimension import Dimension
 from devito.types.utils import DimensionTuple
 from devito.warnings import warn
+
+from .differentiable import Add, Differentiable, Mul, diffify, interp_for_fd
+from .finite_difference import cross_derivative, generic_derivative
+from .rsfd import d45
+from .tools import direct, transpose
 
 __all__ = ['Derivative']
 
@@ -37,7 +39,7 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
         Derivative order.
     side : Side or tuple of Side, optional, default=centered
         Side of the finite difference location, centered (at x), left (at x - 1)
-        or right (at x +1).
+        or right (at x + 1).
     transpose : Transpose, optional, default=direct
         Forward (matvec=direct) or transpose (matvec=transpose) mode of the
         finite difference.
@@ -94,11 +96,6 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
                    'x0', 'method', 'weights')
 
     def __new__(cls, expr, *dims, **kwargs):
-        # TODO: Delete this
-        if kwargs.get('preprocessed', False):
-            from warnings import warn as pywarn
-            pywarn('I removed the `preprocessed` kwarg')
-
         # Validate the input arguments `expr`, `dims` and `deriv_order`
         expr = cls._validate_expr(expr)
         dims = cls._validate_dims(dims)
@@ -106,13 +103,29 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
         # Count the derivatives w.r.t. each variable
         dcounter = cls._count_derivatives(deriv_order, dims)
 
-        # It's possible that the expr is a `sympy.Number` at this point, which
+        # It is possible that the expr is a `sympy.Number` at this point, which
         # has derivative 0, unless we're taking a 0th derivative.
         if isinstance(expr, sympy.Number):
             if any(dcounter.values()):
                 return 0
             else:
                 return expr
+
+        # It is also possible that the expression itself is just a
+        # `devito.Dimension` type which is:
+        #   - derivative 1 if the Dimension coincides and the number of derivatives
+        #     is 1 ie: `Derivative(x, (x, 1)) == 1`.
+        #   - derivative 0 if the Dimension coincides and the total number of
+        #     derivatives is greater than 1 ie: `Derivative(x, (x, 2)) == 0` and
+        #     `Derivative(x, x, y) == 0`.
+        #   - An unevaluated expression otherwise.
+        if isinstance(expr, Dimension) and expr in dcounter:
+            if dcounter[expr] == 0:
+                pass
+            elif dcounter.pop(expr) == 1 and not dcounter:
+                return 1
+            else:
+                return 0
 
         # Validate the finite difference order `fd_order`
         fd_order = cls._validate_fd_order(kwargs.get('fd_order'), expr, dims, dcounter)
@@ -237,7 +250,11 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
         Required: `expr`, `dims`, and the derivative counter to validate.
         If not provided, the maximum supported order will be used.
         """
-        if fd_order is not None:
+        if isinstance(expr, Dimension):
+            # If the expression is just a dimension `expr.time_order` and
+            # `expr.space_order` are not defined
+            fd_order = (99,)*len(dcounter)
+        elif fd_order is not None:
             # If `fd_order` is specified, then validate
             fcounter = defaultdict(int)
             # First create a dictionary mapping variable wrt which to differentiate
@@ -267,7 +284,7 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
                 expr.time_order
                 if getattr(d, 'is_Time', False)
                 else expr.space_order
-                for d in dcounter.keys()
+                for d in dcounter
             )
         return fd_order
 
@@ -318,20 +335,6 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
                 _fd_order = {self.dims[0]: fd_order}
             except AttributeError:
                 raise TypeError("fd_order incompatible with dimensions") from None
-
-        if isinstance(self.expr, Derivative):
-            # In case this was called on a perfect cross-derivative `u.dxdy`
-            # we need to propagate the call to the nested derivative
-            rkwe = dict(rkw)
-            rkwe.pop('weights', None)
-            if 'x0' in rkwe:
-                rkwe['x0'] = self._filter_dims(self.expr._filter_dims(rkw['x0']),
-                                               neg=True)
-            if fd_order is not None:
-                fdo = self.expr._filter_dims(_fd_order)
-                if fdo:
-                    rkwe['fd_order'] = fdo
-            rkw['expr'] = self.expr(**rkwe)
 
         if fd_order is not None:
             rkw['fd_order'] = self._filter_dims(_fd_order, as_tuple=True)
@@ -465,10 +468,7 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
         This is really useful for more advanced FD definitions. For example
         the conventional Laplacian is `.dxl.T * .dxl`
         """
-        if self._transpose == direct:
-            adjoint = transpose
-        else:
-            adjoint = direct
+        adjoint = transpose if self._transpose == direct else direct
 
         return self._rebuild(transpose=adjoint)
 
@@ -487,28 +487,51 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
         if self.expr.staggered == func.staggered and self.expr.is_Function:
             return self
 
+        # Check if x0's keys come from a DerivedDimension
         x0 = func.indices_ref.getters
+        psubs = {}
+        nx0 = x0.copy()
+        for d in x0:
+            if d in self.dims:
+                # d is a valid Derivative dimension
+                continue
+            for sd in self.dims:
+                if sd in d._defines:
+                    # x0 key is a DerivedDimension of the derivative dimension
+                    # e.g f.dx(x0={ix: ix + h_x/2}) for a subdomain
+                    # Set x0 to the derivative dimension and add a substitution
+                    # to the parent
+                    # e.g f.dx(x0={x: x + h_x/2}).subs({x: ix})
+                    psubs[sd] = d
+                    nx0[sd] = nx0.pop(d)._subs(d, sd)
+        rkw = {'x0': nx0}
+        if psubs:
+            rkw['subs'] = (psubs,)
+
         if self.expr.is_Add:
             # If `expr` has both staggered and non-staggered terms such as
             # `(u(x + h_x/2) + v(x)).dx` then we exploit linearity of FD to split
             # it into `u(x + h_x/2).dx` and `v(x).dx`, since they require
             # different FD indices
             mapper = as_mapper(self.expr._args_diff, lambda i: i.staggered)
+            if len(mapper) == 1:
+                # All terms have the same staggering, we can use expr as is
+                return self._rebuild(self.expr, **rkw)
             args = [self.expr.func(*v) for v in mapper.values()]
             args.extend([a for a in self.expr.args if a not in self.expr._args_diff])
-            args = [self._rebuild(expr=a, x0=x0) for a in args]
+            args = [self._rebuild(a)._eval_at(func) for a in args]
             return self.expr.func(*args)
         elif self.expr.is_Mul:
             # For Mul, We treat the basic case `u(x + h_x/2) * v(x) which is what appear
             # in most equation with div(a * u) for example. The expression is re-centered
             # at the highest priority index (see _gather_for_diff) to compute the
             # derivative at x0.
-            return self._rebuild(self.expr._gather_for_diff, x0=x0)
+            return self._rebuild(self.expr._gather_for_diff, **rkw)
         else:
-            # For every other cases, that has more functions or more complexe arithmetic,
+            # For every other cases, that has more functions or more complex arithmetic,
             # there is not actual way to decide what to do so it’s as safe to use
             # the expression as is.
-            return self._rebuild(x0=x0)
+            return self._rebuild(self.expr, **rkw)
 
     def _evaluate(self, **kwargs):
         # Evaluate finite-difference.
@@ -545,10 +568,8 @@ class Derivative(sympy.Derivative, Differentiable, Pickable):
             expr = interp_for_fd(expr, x0_interp, **kwargs)
 
         # Step 2: Evaluate derivatives within expression
-        try:
+        with suppress(AttributeError):
             expr = expr._evaluate(**kwargs)
-        except AttributeError:
-            pass
 
         # If True, the derivative will be fully expanded as a sum of products,
         # otherwise an IndexSum will returned

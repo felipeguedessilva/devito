@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 
 from devito import Dimension, Function, Grid
-from devito.types import StencilDimension, SparseFunction, PrecomputedSparseFunction
 from devito.data.allocators import DataReference
+from devito.types import PrecomputedSparseFunction, SparseFunction, StencilDimension
 
 
 class TestFunction:
@@ -99,6 +99,6 @@ class TestSparseFunction:
 
         assert s.coordinates is not None
 
-        # Explicity set coordinates to None
+        # Explicitly set coordinates to None
         sr = s._rebuild(function=None, initializer=None, coordinates=None)
         assert sr.coordinates is None

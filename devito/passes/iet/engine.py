@@ -1,25 +1,25 @@
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
+from contextlib import suppress
 from functools import partial, singledispatch, wraps
 
 import numpy as np
 from sympy import Mul
 
 from devito.ir.iet import (
-    Call, ExprStmt, Expression, Iteration, SyncSpot, AsyncCallable, FindNodes,
-    FindSymbols, MapNodes, MetaCall, Transformer, EntryFunction,
-    ThreadCallable, Uxreplace, derive_parameters
+    AsyncCallable, Call, EntryFunction, Expression, ExprStmt, FindNodes, FindSymbols,
+    Iteration, MapNodes, MetaCall, SyncSpot, ThreadCallable, Transformer, Uxreplace,
+    derive_parameters
 )
 from devito.ir.support import SymbolRegistry
 from devito.mpi.distributed import MPINeighborhood
-from devito.mpi.routines import Gather, Scatter, HaloUpdate, HaloWait, MPIMsg
+from devito.mpi.routines import Gather, HaloUpdate, HaloWait, MPIMsg, Scatter
 from devito.passes import needs_transfer
-from devito.symbolics import (FieldFromComposite, FieldFromPointer, IndexedPointer,
-                              search)
+from devito.symbolics import FieldFromComposite, FieldFromPointer, IndexedPointer, search
 from devito.tools import DAG, as_tuple, filter_ordered, sorted_priority, timed_pass
 from devito.types import (
-    Array, Bundle, ComponentAccess, CompositeObject, Lock, IncrDimension,
-    ModuloDimension, Indirection, Pointer, SharedData, ThreadArray, Symbol, Temp,
-    NPThreads, NThreadsBase, Wildcard
+    Array, Bundle, ComponentAccess, CompositeObject, IncrDimension, Indirection, Lock,
+    ModuloDimension, NPThreads, NThreadsBase, Pointer, SharedData, Symbol, Temp,
+    ThreadArray, Wildcard
 )
 from devito.types.args import ArgProvider
 from devito.types.dense import DiscreteFunction
@@ -28,7 +28,31 @@ from devito.types.dimension import AbstractIncrDimension, BlockDimension
 __all__ = ['Graph', 'iet_pass', 'iet_visit']
 
 
-class Graph:
+class Byproduct:
+
+    """
+    A Byproduct is a mutable collection of metadata produced by one or more
+    compiler passes.
+
+    This metadata may be used internally or by the caller itself, typically
+    for code generation purposes.
+    """
+
+    def __init__(self, efuncs=None, includes=None, headers=None, namespaces=None,
+                 globs=None):
+        self.efuncs = efuncs or {}
+        self.includes = includes or []
+        self.headers = headers or []
+        self.namespaces = namespaces or []
+        self.globals = globs or []
+
+    @property
+    def funcs(self):
+        return tuple(MetaCall(v, True) for v in self.efuncs.values()
+                     if not isinstance(v, EntryFunction))
+
+
+class Graph(Byproduct):
 
     """
     DAG representation of a call graph.
@@ -49,16 +73,9 @@ class Graph:
     """
 
     def __init__(self, iet, options=None, sregistry=None, **kwargs):
-        self.efuncs = OrderedDict([(iet.name, iet)])
-
         self.sregistry = sregistry
 
-        self.includes = []
-        self.headers = []
-        self.namespaces = []
-        self.globals = []
-
-        # Stash immutable information useful for one or more compiler passes
+        super().__init__({iet.name: iet})
 
         # All written user-level objects
         writes = FindSymbols('writes').visit(iet)
@@ -78,10 +95,6 @@ class Graph:
     @property
     def root(self):
         return self.efuncs[list(self.efuncs).pop(0)]
-
-    @property
-    def funcs(self):
-        return tuple(MetaCall(v, True) for v in self.efuncs.values())[1:]
 
     @property
     def sync_mapper(self):
@@ -106,11 +119,9 @@ class Graph:
                     continue
 
                 for j in dag.all_predecessors(i.name):
-                    try:
+                    with suppress(KeyError):
+                        # In the case where `j` is a foreign Callable
                         v.extend(FindNodes(Iteration).visit(self.efuncs[j]))
-                    except KeyError:
-                        # `j` is a foreign Callable
-                        pass
 
         return found
 
@@ -134,9 +145,9 @@ class Graph:
             try:
                 compiler = kwargs['compiler']
                 compiler.add_include_dirs(as_tuple(metadata.get('include_dirs')))
-                compiler.add_libraries(as_tuple(metadata.get('libs')))
                 compiler.add_library_dirs(as_tuple(metadata.get('lib_dirs')),
                                           rpath=metadata.get('rpath', False))
+                compiler.add_libraries(as_tuple(metadata.get('libs')))
             except KeyError:
                 pass
 
@@ -146,7 +157,7 @@ class Graph:
             new_efuncs = metadata.get('efuncs', [])
 
             efuncs[i] = efunc
-            efuncs.update(OrderedDict([(i.name, i) for i in new_efuncs]))
+            efuncs.update(dict([(i.name, i) for i in new_efuncs]))
 
             # Update the parameters / arguments lists since `func` may have
             # introduced or removed objects
@@ -176,9 +187,23 @@ class Graph:
         dag = create_call_graph(self.root.name, self.efuncs)
         toposort = dag.topological_sort()
 
-        mapper = OrderedDict([(i, func(self.efuncs[i], **kwargs)) for i in toposort])
+        mapper = dict([(i, func(self.efuncs[i], **kwargs)) for i in toposort])
 
         return mapper
+
+    def filter(self, key):
+        """
+        Return a Byproduct containing only the Callables in the Graph
+        for which `key` evaluates to True. The resulting object cannot be
+        further modified by an IET pass.
+        """
+        return Byproduct(
+            efuncs={i: v for i, v in self.efuncs.items() if key(v)},
+            includes=as_tuple(self.includes),
+            headers=as_tuple(self.headers),
+            namespaces=as_tuple(self.namespaces),
+            globs=as_tuple(self.globals)
+        )
 
 
 def iet_pass(func):
@@ -191,10 +216,7 @@ def iet_pass(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        if timed_pass.is_enabled():
-            maybe_timed = timed_pass
-        else:
-            maybe_timed = lambda func, name: func
+        maybe_timed = timed_pass if timed_pass.is_enabled() else lambda func, name: func
         try:
             # If the pass has been disabled, skip it
             if not kwargs['options'][func.__name__]:
@@ -290,7 +312,7 @@ def reuse_compounds(efuncs, sregistry=None):
 
         mapper.update({i0: i1, b0: b1})
 
-        for f0, f1 in zip(i0.fields, i1.fields):
+        for f0, f1 in zip(i0.fields, i1.fields, strict=True):
             for cls in (FieldFromComposite, FieldFromPointer):
                 if f0.is_AbstractFunction:
                     mapper[cls(f0._C_symbol, b0)] = cls(f1._C_symbol, b1)
@@ -369,7 +391,7 @@ def abstract_component_accesses(efuncs):
         f_flatten = f.func(name='flat_data', components=f.c0)
 
         subs = {}
-        for ca, o in zip(compaccs, compoff_params):
+        for ca, o in zip(compaccs, compoff_params, strict=True):
             indices = [Mul(arity_param, i, evaluate=False) for i in ca.indices]
             indices[-1] += o
             subs[ca] = f_flatten.indexed[indices]
@@ -435,7 +457,7 @@ def reuse_efuncs(root, efuncs, sregistry=None):
         key = afunc._signature()
 
         try:
-            # If we manage to succesfully map `efunc` to a previously abstracted
+            # If we manage to successfully map `efunc` to a previously abstracted
             # `afunc`, we need to update the call sites to use the new Call name
             afunc, mapped = mapper[key]
             mapped.append(efunc)
@@ -600,7 +622,7 @@ def _(i, mapper, sregistry):
 
     name0 = pp.name
     base = sregistry.make_name(prefix=name0)
-    name1 = sregistry.make_name(prefix='%s_blk' % base)
+    name1 = sregistry.make_name(prefix=f'{base}_blk')
 
     bd = i.parent._rebuild(name1, pp)
     d = i._rebuild(name0, bd, i._min.subs(p, bd), i._max.subs(p, bd))
@@ -718,7 +740,7 @@ def update_args(root, efuncs, dag):
 
         for a in new_params:
             if a in processed:
-                # A child efunc trying to add a symbol alredy added by a
+                # A child efunc trying to add a symbol already added by a
                 # sibling efunc
                 continue
 
@@ -732,7 +754,7 @@ def update_args(root, efuncs, dag):
 
         return processed
 
-    efuncs = OrderedDict(efuncs)
+    efuncs = dict(efuncs)
     efuncs[root.name] = root._rebuild(parameters=_filter(root.parameters, root))
 
     # Update all call sites to use the new signature

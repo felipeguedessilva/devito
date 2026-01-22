@@ -1,0 +1,30 @@
+name: main triggers
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main         # Push events on main branch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Trigger doc build
+      uses: peter-evans/repository-dispatch@v4
+      with:
+        token: ${{ secrets.DEPLOY_DOC_PAT }}
+        repository: devitocodes/devitoproject.org
+        event-type: deploy-docs
+
+    - name: Trigger pro submodule update
+      uses: peter-evans/repository-dispatch@v4
+      with:
+        token: ${{ secrets.PRO_SUBMODULE }}
+        repository: devitocodespro/devitopro
+        event-type: update-submodule

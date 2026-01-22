@@ -9,8 +9,9 @@ import numpy as np
 from sympy import S
 
 from devito.arch import get_advisor_path
-from devito.ir.iet import (ExpressionBundle, List, TimedList, Section,
-                           Iteration, FindNodes, Transformer)
+from devito.ir.iet import (
+    ExpressionBundle, FindNodes, Iteration, List, Section, TimedList, Transformer
+)
 from devito.ir.support import IntervalGroup
 from devito.logger import warning
 from devito.mpi import MPI
@@ -195,7 +196,7 @@ class Profiler:
         comm = args.comm
 
         summary = PerformanceSummary()
-        for name, data in self._sections.items():
+        for name in self._sections:
             # Time to run the section
             time = max(getattr(args[self.name]._obj, name), 10e-7)
 
@@ -248,7 +249,7 @@ class AdvancedProfiler(Profiler):
 
             traffic = np.nan
 
-        # Nmber of FLOPs performed at each iteration
+        # Number of FLOPs performed at each iteration
         sops = data.sops
 
         # Runtime itermaps/itershapes
@@ -274,7 +275,7 @@ class AdvancedProfiler(Profiler):
         sops = [sops]*comm.size
         itershapess = comm.allgather(itershapes)
 
-        return list(zip(times, opss, pointss, traffics, sops, itershapess))
+        return list(zip(times, opss, pointss, traffics, sops, itershapess, strict=True))
 
     # Override basic summary so that arguments other than runtime are computed.
     def summary(self, args, dtype, reduce_over=None):
@@ -317,7 +318,7 @@ class AdvancedProfiler(Profiler):
             # Same as above but without setup overheads (e.g., host-device
             # data transfers)
             mapper = defaultdict(list)
-            for (name, rank), v in summary.items():
+            for (name, _), v in summary.items():
                 mapper[name].append(v.time)
             reduce_over_nosetup = sum(max(i) for i in mapper.values())
             if reduce_over_nosetup == 0:
@@ -393,9 +394,9 @@ class AdvisorProfiler(AdvancedProfiler):
             if i.dim.is_Time:
                 # The calls to Advisor's Collection Control API are only for Operators
                 # with a time loop
-                mapper[i] = List(header=c.Statement('%s()' % self._api_resume),
+                mapper[i] = List(header=c.Statement(f'{self._api_resume}()'),
                                  body=i,
-                                 footer=c.Statement('%s()' % self._api_pause))
+                                 footer=c.Statement(f'{self._api_pause}()'))
                 return Transformer(mapper).visit(iet)
 
         # Return the IET intact if no time loop is found
@@ -459,10 +460,7 @@ class PerformanceSummary(OrderedDict):
         gflops = float(ops)/10**9
         gflopss = gflops/time
 
-        if np.isnan(traffic) or traffic == 0:
-            oi = None
-        else:
-            oi = float(ops/traffic)
+        oi = None if np.isnan(traffic) or traffic == 0 else float(ops / traffic)
 
         self.globals[key] = PerfEntry(time, gflopss, None, oi, None, None)
 

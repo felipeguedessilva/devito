@@ -2,31 +2,34 @@ from functools import cached_property
 
 import numpy as np
 import pytest
-
 from sympy import Mul  # noqa
 
-from conftest import (skipif, EVAL, _R, assert_structure, assert_blocking,  # noqa
-                      get_params, get_arrays, check_array)
-from devito import (NODE, Eq, Inc, Constant, Function, TimeFunction,  # noqa
-                    SparseTimeFunction, Dimension, SubDimension,
-                    ConditionalDimension, DefaultDimension, Grid, Operator,
-                    norm, grad, div, dimensions, switchconfig, configuration,
-                    first_derivative, solve, transpose, Abs, cos, exp,
-                    sin, sqrt, floor, Ge, Lt, Derivative)
+from conftest import (  # noqa
+    _R, EVAL, assert_blocking, assert_structure, check_array, get_arrays, get_params,
+    skipif
+)
+from devito import (  # noqa
+    NODE, Abs, ConditionalDimension, Constant, DefaultDimension, Derivative, Dimension,
+    Eq, Function, Ge, Grid, Inc, Lt, Operator, SparseTimeFunction, SubDimension,
+    TimeFunction, configuration, cos, dimensions, div, exp, first_derivative, floor, grad,
+    norm, sin, solve, sqrt, switchconfig, transpose
+)
 from devito.exceptions import InvalidArgument, InvalidOperator
-from devito.ir import (Conditional, DummyEq, Expression, Iteration, FindNodes,
-                       FindSymbols, ParallelIteration, retrieve_iteration_tree)
+from devito.ir import (
+    Conditional, DummyEq, Expression, FindNodes, FindSymbols, Iteration,
+    ParallelIteration, retrieve_iteration_tree
+)
 from devito.passes.clusters.aliases import collect
 from devito.passes.clusters.factorization import collect_nested
 from devito.passes.iet.parpragma import VExpanded
-from devito.symbolics import (INT, FLOAT, DefFunction, FieldFromPointer,  # noqa
-                              IndexedPointer, Keyword, SizeOf, estimate_cost,
-                              pow_to_mul, indexify)
+from devito.symbolics import (  # noqa
+    FLOAT, INT, DefFunction, FieldFromPointer, IndexedPointer, Keyword, SizeOf,
+    estimate_cost, indexify, pow_to_mul
+)
 from devito.tools import as_tuple
-from devito.types import Scalar, Symbol, PrecomputedSparseTimeFunction
-
+from devito.types import PrecomputedSparseTimeFunction, Scalar, Symbol
+from examples.seismic import AcquisitionGeometry, demo_model
 from examples.seismic.acoustic import AcousticWaveSolver
-from examples.seismic import demo_model, AcquisitionGeometry
 from examples.seismic.tti import AnisotropicWaveSolver
 
 
@@ -47,7 +50,9 @@ def test_scheduling_after_rewrite():
     trees = retrieve_iteration_tree(op)
 
     # Check loop nest structure
-    assert all(i.dim is j for i, j in zip(trees[0], grid.dimensions))  # time invariant
+    assert all(
+        i.dim is j for i, j in zip(trees[0], grid.dimensions, strict=True)
+    )  # time invariant
     assert trees[1].root.dim is grid.time_dim
     assert all(trees[1].root.dim is tree.root.dim for tree in trees[1:])
 
@@ -700,8 +705,8 @@ class TestAliases:
             Operator(eqn, opt=('advanced-fsg', {'openmp': True, 'min-storage': True}))
         except InvalidOperator:
             assert True
-        except:
-            assert False
+        except Exception as e:
+            raise AssertionError('Assert False') from e
 
         # Check that `cire-rotate=True` has no effect in this code has there's
         # no blocking
@@ -1588,7 +1593,7 @@ class TestAliases:
         so = 8
         grid = Grid(shape=(6, 6, 6))
 
-        f = Function(name='f', grid=grid, space_order=so, parameter=True)
+        f = Function(name='f', grid=grid, space_order=so)
         v = TimeFunction(name="v", grid=grid, space_order=so)
         v1 = TimeFunction(name="v1", grid=grid, space_order=so)
         p = TimeFunction(name="p", grid=grid, space_order=so, staggered=NODE)
@@ -1745,7 +1750,7 @@ class TestAliases:
         assert len([i for i in FindSymbols().visit(bns['x0_blk0']) if i.is_Array]) == 7
         assert len(FindNodes(VExpanded).visit(pbs['x0_blk0'])) == 3
 
-    @pytest.mark.parametrize('so_ops', [(4, 147), (8, 211)])
+    @pytest.mark.parametrize('so_ops', [(4, 146), (8, 210)])
     @switchconfig(profiling='advanced')
     def test_tti_J_akin_complete(self, so_ops):
         grid = Grid(shape=(16, 16, 16))
@@ -2099,7 +2104,7 @@ class TestAliases:
         eqn = Eq(v.forward, eval(expr))
 
         op0 = Operator(eqn, opt=('noop', {'openmp': True}))
-        op1 = Operator(eqn, opt=('collect-derivs', 'cire-sops', {'openmp': True}))
+        op1 = Operator(eqn, opt=('deriv-collect', 'cire-sops', {'openmp': True}))
         op2 = Operator(eqn, opt=('cire-sops', {'openmp': True}))
         op3 = Operator(eqn, opt=('advanced', {'openmp': True}))
 
@@ -2129,7 +2134,7 @@ class TestAliases:
             # Also check against expected operation count to make sure
             # all redundancies have been detected correctly
             for i, expected in enumerate(as_tuple(exp_ops[n])):
-                assert summary[('section%d' % i, None)].ops == expected
+                assert summary[(f'section{i}', None)].ops == expected
 
     def test_derivatives_from_different_levels(self):
         """
@@ -2323,10 +2328,7 @@ class TestAliases:
                                              'cire-rotate': rotate, 'min-storage': True}))
 
         # Check code generation
-        if 'openmp' in configuration['language']:
-            prefix = ['t']
-        else:
-            prefix = []
+        prefix = ['t'] if 'openmp' in configuration['language'] else []
         if rotate:
             assert_structure(
                 op1,
@@ -2551,7 +2553,7 @@ class TestAliases:
         op = Operator(eqn, opt='advanced')
         assert_structure(op, ['t', 't,fd', 't,fd,x,y'], 't,fd,x,y')
         # Make sure it compiles
-        op.cfunction
+        _ = op.cfunction
 
         # Check hoisting for time invariant
         eqn = Eq(u, u - (cos(time_sub * factor * f) * sin(g) * uf))
@@ -2559,7 +2561,7 @@ class TestAliases:
         op = Operator(eqn, opt='advanced')
         assert_structure(op, ['x,y', 't', 't,fd', 't,fd,x,y'], 'x,y,t,fd,x,y')
         # Make sure it compiles
-        op.cfunction
+        _ = op.cfunction
 
     def test_hoisting_pow_one(self):
         """
@@ -2606,7 +2608,7 @@ class TestAliases:
         # it behaves as if it were one
         mock_custom_deriv = u.dx.dy.evaluate
 
-        # This symbolic operation -- creating an Add between an arbitray object
+        # This symbolic operation -- creating an Add between an arbitrary object
         # and an EvalDerivative -- caused the EvalDerivative to be prematurely
         # simplified being flatten into an Add
         expr0 = u.dt - mock_custom_deriv
@@ -2664,6 +2666,25 @@ class TestAliases:
         op()
         assert np.all(src.data == 8)
 
+    def test_space_and_time_invariant_together(self):
+        grid = Grid(shape=(34, 45, 50))
+
+        a = Function(name='a', grid=grid, space_order=8)
+        vx = TimeFunction(name='vx', grid=grid, space_order=8)
+        tzz = vx.func(name='tzz')
+
+        eqn = Eq(tzz.forward, a.dy.dz * (vx.dx.dy + vx.dx.dz) + tzz)
+
+        op = Operator(eqn, opt=('advanced', {'openmp': False}))
+
+        _ = op.cfunction
+
+        assert_structure(
+            op,
+            ['t,x0_blk0,y0_blk0,x,y,z', 't,x0_blk0,y0_blk0,x,y,z'],
+            'tx0_blk0y0_blk0xyzyz'
+        )
+
 
 class TestIsoAcoustic:
 
@@ -2706,9 +2727,9 @@ class TestIsoAcoustic:
         bns, _ = assert_blocking(op0, {})
         bns, _ = assert_blocking(op1, {'x0_blk0'})  # due to loop blocking
 
-        assert summary0[('section0', None)].ops == 50
+        assert summary0[('section0', None)].ops == 55
         assert summary0[('section1', None)].ops == 44
-        assert np.isclose(summary0[('section0', None)].oi, 2.851, atol=0.001)
+        assert np.isclose(summary0[('section0', None)].oi, 3.136, atol=0.001)
 
         assert summary1[('section0', None)].ops == 31
         assert summary1[('section1', None)].ops == 88
@@ -2723,7 +2744,7 @@ class TestTTI:
 
     @cached_property
     def model(self):
-        # TTI layered model for the tti test, no need for a smooth interace
+        # TTI layered model for the tti test, no need for a smooth interface
         # bewtween the two layer as the compilation passes are tested, not the
         # physical prettiness of the result -- which ultimately saves time
         return demo_model('layers-tti', nlayers=3, nbl=10, space_order=8,
@@ -2760,7 +2781,7 @@ class TestTTI:
         # Make sure no opts were applied
         op = wavesolver.op_fwd(False)
         assert len(op._func_table) == 0
-        assert summary[('section0', None)].ops == 743
+        assert summary[('section0', None)].ops == 753
 
         return v, rec
 
@@ -2846,7 +2867,7 @@ class TestTTIv2:
 
     @switchconfig(profiling='advanced')
     @pytest.mark.parametrize('space_order,expected', [
-        (4, 200), (12, 392)
+        (4, 190), (12, 382)
     ])
     def test_opcounts(self, space_order, expected):
         grid = Grid(shape=(3, 3, 3))

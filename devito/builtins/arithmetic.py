@@ -1,9 +1,9 @@
 import numpy as np
 
 import devito as dv
-from devito.builtins.utils import make_retval, check_builtins_args
+from devito.builtins.utils import check_builtins_args, make_retval
 
-__all__ = ['norm', 'sumall', 'sum', 'inner', 'mmin', 'mmax']
+__all__ = ['inner', 'mmax', 'mmin', 'norm', 'sum', 'sumall']
 
 
 @dv.switchconfig(log_level='ERROR')
@@ -33,7 +33,7 @@ def norm(f, order=2):
 
     op = dv.Operator([dv.Eq(s, 0.0)] + eqns +
                      [dv.Inc(s, Pow(dv.Abs(p), order)), dv.Eq(n[0], s)],
-                     name='norm%d' % order)
+                     name=f'norm{order}')
     op.apply(**kwargs)
 
     v = np.power(n.data[0], 1/order)
@@ -63,24 +63,24 @@ def sum(f, dims=None):
     new_dims = tuple(d for d in f.dimensions if d not in dims)
     shape = tuple(f._size_domain[d] for d in new_dims)
     if f.is_TimeFunction and f.time_dim not in dims:
-        out = f._rebuild(name="%ssum" % f.name, shape=shape, dimensions=new_dims,
+        out = f._rebuild(name=f'{f.name}sum', shape=shape, dimensions=new_dims,
                          initializer=np.empty(0))
     elif f.is_SparseTimeFunction:
         if f.time_dim in dims:
             # Sum over time -> SparseFunction
             new_coords = f.coordinates._rebuild(
-                name="%ssum_coords" % f.name, initializer=f.coordinates.initializer
+                name=f'{f.name}sum_coords', initializer=f.coordinates.initializer
             )
-            out = dv.SparseFunction(name="%ssum" % f.name, grid=f.grid,
+            out = dv.SparseFunction(name=f'{f.name}sum', grid=f.grid,
                                     dimensions=new_dims, npoint=f.shape[1],
                                     coordinates=new_coords)
         else:
             # Sum over rec -> TimeFunction
-            out = dv.TimeFunction(name="%ssum" % f.name, grid=f.grid, shape=shape,
+            out = dv.TimeFunction(name=f'{f.name}sum', grid=f.grid, shape=shape,
                                   dimensions=new_dims, space_order=0,
                                   time_order=f.time_order)
     else:
-        out = dv.Function(name="%ssum" % f.name, grid=f.grid,
+        out = dv.Function(name=f'{f.name}sum', grid=f.grid,
                           space_order=f.space_order, shape=shape,
                           dimensions=new_dims)
 
@@ -180,8 +180,6 @@ def inner(f, g):
     return f.dtype(n.data[0])
 
 
-@dv.switchconfig(log_level='ERROR')
-@check_builtins_args
 def mmin(f):
     """
     Retrieve the minimum.
@@ -191,21 +189,9 @@ def mmin(f):
     f : array_like or Function
         Input operand.
     """
-    if isinstance(f, dv.Constant):
-        return f.data
-    elif isinstance(f, dv.types.dense.DiscreteFunction):
-        v = np.min(f.data_ro_domain)
-        if f.grid is None or not dv.configuration['mpi']:
-            return v.item()
-        else:
-            comm = f.grid.distributor.comm
-            return comm.allreduce(v, dv.mpi.MPI.MIN).item()
-    else:
-        raise ValueError("Expected Function, got `%s`" % type(f))
+    return _reduce_func(f, np.min, dv.mpi.MPI.MIN)
 
 
-@dv.switchconfig(log_level='ERROR')
-@check_builtins_args
 def mmax(f):
     """
     Retrieve the maximum.
@@ -215,14 +201,20 @@ def mmax(f):
     f : array_like or Function
         Input operand.
     """
+    return _reduce_func(f, np.max, dv.mpi.MPI.MAX)
+
+
+@dv.switchconfig(log_level='ERROR')
+@check_builtins_args
+def _reduce_func(f, func, mfunc):
     if isinstance(f, dv.Constant):
         return f.data
     elif isinstance(f, dv.types.dense.DiscreteFunction):
-        v = np.max(f.data_ro_domain)
-        if f.grid is None or not dv.configuration['mpi']:
-            return v.item()
-        else:
+        v = func(f.data_ro_domain)
+        if f.data._is_decomposed:
             comm = f.grid.distributor.comm
-            return comm.allreduce(v, dv.mpi.MPI.MAX).item()
+            return comm.allreduce(v, mfunc).item()
+        else:
+            return v.item()
     else:
-        raise ValueError("Expected Function, got `%s`" % type(f))
+        raise ValueError(f'Expected Function, got `{type(f)}`')

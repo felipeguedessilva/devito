@@ -1,14 +1,14 @@
 """The parameters dictionary contains global parameter settings."""
-
+import os
+from abc import ABC, abstractmethod
 from collections import OrderedDict
-from os import environ
 from functools import wraps
 
 from devito.logger import info, warning
 from devito.tools import Signer, filter_ordered
 
 __all__ = ['configuration', 'init_configuration', 'print_defaults', 'print_state',
-           'switchconfig']
+           'switchconfig', 'switchenv']
 
 # Be EXTREMELY careful when writing to a Parameters dictionary
 # Read here for reference: http://wiki.c2.com/?GlobalVariablesAreBad
@@ -48,23 +48,23 @@ class Parameters(OrderedDict, Signer):
             if accepted is not None:
                 tocheck = list(value) if isinstance(value, dict) else [value]
                 if any(i not in accepted for i in tocheck):
-                    raise ValueError("Illegal configuration parameter (%s, %s). "
-                                     "Accepted: %s" % (key, value, str(accepted)))
+                    raise ValueError(f"Illegal configuration parameter ({key}, {value}). "
+                                     f"Accepted: {str(accepted)}")
             return func(self, key, value)
         return wrapper
 
     def _check_key_deprecation(func):
         def wrapper(self, key, value=None):
             if key in self._deprecated:
-                warning("Trying to access deprecated config `%s`. Using `%s` instead"
-                        % (key, self._deprecated[key]))
+                warning(f"Trying to access deprecated config `{key}`. "
+                        f"Using `{self._deprecated[key]}` instead")
                 key = self._deprecated[key]
             return func(self, key, value)
         return wrapper
 
     def _preprocess(self, key, value):
         """
-        Execute the preprocesser associated to ``key``, if any. This will
+        Execute the preprocessor associated to ``key``, if any. This will
         return a new value.
         """
         if key in self._preprocess_functions:
@@ -170,24 +170,24 @@ configuration = Parameters("Devito-Configuration")
 def init_configuration(configuration=configuration, env_vars_mapper=env_vars_mapper,
                        env_vars_deprecated=env_vars_deprecated):
     # Populate `configuration` with user-provided options
-    if environ.get('DEVITO_CONFIG') is None:
+    if os.environ.get('DEVITO_CONFIG') is None:
         # It is important to configure `platform`, `compiler`, and the rest, in this order
         process_order = filter_ordered(['platform', 'compiler'] +
                                        list(env_vars_mapper.values()))
         queue = sorted(env_vars_mapper.items(), key=lambda i: process_order.index(i[1]))
-        unprocessed = OrderedDict([(v, environ.get(k, configuration._defaults[v]))
+        unprocessed = OrderedDict([(v, os.environ.get(k, configuration._defaults[v]))
                                    for k, v in queue])
 
         # Handle deprecated env vars
         mapper = dict(queue)
         for k, (v, msg) in env_vars_deprecated.items():
-            if environ.get(k):
-                warning("`%s` is deprecated. %s" % (k, msg))
-                if environ.get(v):
-                    warning("Both `%s` and `%s` set. Ignoring `%s`" % (k, v, k))
+            if os.environ.get(k):
+                warning(f"`{k}` is deprecated. {msg}")
+                if os.environ.get(v):
+                    warning(f"Both `{k}` and `{v}` set. Ignoring `{k}`")
                 else:
-                    warning("Setting `%s=%s`" % (v, environ[k]))
-                    unprocessed[mapper[v]] = environ[k]
+                    warning(f"Setting `{v}={os.environ[k]}`")
+                    unprocessed[mapper[v]] = os.environ[k]
     else:
         # Attempt reading from the specified configuration file
         raise NotImplementedError("Devito doesn't support configuration via file yet.")
@@ -197,7 +197,7 @@ def init_configuration(configuration=configuration, env_vars_mapper=env_vars_map
         try:
             items = v.split(';')
             # Env variable format: 'var=k1:v1;k2:v2:k3:v3:...'
-            keys, values = zip(*[i.split(':') for i in items])
+            keys, values = zip(*[i.split(':') for i in items], strict=True)
             # Casting
             values = [eval(i) for i in values]
         except AttributeError:
@@ -215,7 +215,7 @@ def init_configuration(configuration=configuration, env_vars_mapper=env_vars_map
                 except (TypeError, ValueError):
                     keys[i] = j
         if len(keys) == len(values):
-            configuration.update(k, dict(zip(keys, values)))
+            configuration.update(k, dict(zip(keys, values, strict=True)))
         elif len(keys) == 1:
             configuration.update(k, keys[0])
         else:
@@ -224,34 +224,25 @@ def init_configuration(configuration=configuration, env_vars_mapper=env_vars_map
     configuration.initialize()
 
 
-class switchconfig:
-
+class SwitchDecorator(ABC):
     """
-    Decorator or context manager to temporarily change `configuration` parameters.
+    Abstract base class that turns a context manager class into a decorator.
     """
+    @abstractmethod
+    def __init__(self, *args, **kwargs):
+        pass
 
-    def __init__(self, condition=True, **params):
-        if condition:
-            self.params = {k.replace('_', '-'): v for k, v in params.items()}
-        else:
-            self.params = {}
-        self.previous = {}
+    @abstractmethod
+    def __enter__(self):
+        pass
 
-    def __enter__(self, condition=True, **params):
-        self.previous = {}
-        for k, v in self.params.items():
-            self.previous[k] = configuration[k]
-            configuration[k] = v
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        for k, v in self.params.items():
-            try:
-                configuration[k] = self.previous[k]
-            except ValueError:
-                # E.g., `platform` and `compiler` will end up here
-                super(Parameters, configuration).__setitem__(k, self.previous[k])
+    @abstractmethod
+    def __exit__(self, exc_type, exc_val, traceback):
+        pass
 
     def __call__(self, func, *args, **kwargs):
+        """ The call method turns the context manager class into a decorator
+        """
         @wraps(func)
         def wrapper(*args, **kwargs):
             with self:
@@ -260,15 +251,59 @@ class switchconfig:
         return wrapper
 
 
+class switchconfig(SwitchDecorator):
+    """
+    Decorator or context manager to temporarily change `configuration` parameters.
+    """
+    def __init__(self, condition=True, **params):
+        if condition:
+            self.params = {k.replace('_', '-'): v for k, v in params.items()}
+        else:
+            self.params = {}
+        self.previous = {}
+
+    def __enter__(self):
+        self.previous = {}
+        for k, v in self.params.items():
+            self.previous[k] = configuration[k]
+            configuration[k] = v
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        for k in self.params:
+            try:
+                configuration[k] = self.previous[k]
+            except ValueError:
+                # E.g., `platform` and `compiler` will end up here
+                super(Parameters, configuration).__setitem__(k, self.previous[k])
+
+
+class switchenv(SwitchDecorator):
+    """
+    Temporarily set environment variables from a dictionary
+
+    Note: This does not propagate any environment variables that change inside
+    the context manager, so should be used cautiously.
+    """
+    def __init__(self, params):
+        self.previous = dict(os.environ)
+        self.params = params
+
+    def __enter__(self):
+        os.environ.update(self.params)
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        os.environ.clear()
+        os.environ.update(self.previous)
+
+
 def print_defaults():
     """Print the environment variables accepted by Devito, their default value,
     as well as all of the accepted values."""
     for k, v in env_vars_mapper.items():
-        info('%s: %s. Default: %s' % (k, configuration._accepted[v],
-                                      configuration._defaults[v]))
+        info(f'{k}: {configuration._accepted[v]}. Default: {configuration._defaults[v]}')
 
 
 def print_state():
     """Print the current configuration state."""
     for k, v in configuration.items():
-        info('%s: %s' % (k, v))
+        info(f'{k}: {v}')
