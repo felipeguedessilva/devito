@@ -112,7 +112,7 @@ class MemoryAllocator(AbstractMemoryAllocator):
             raise RuntimeError(f"Unable to allocate {size} elements in memory")
 
         # Compute the pointer to the user data
-        padleft_bytes = padleft * ctypes.sizeof(ctype)
+        padleft_bytes = int(padleft * ctypes.sizeof(ctype))
         c_pointer = ctypes.c_void_p(padleft_pointer.value + padleft_bytes)
 
         # Cast to 1D array of the specified `datasize`

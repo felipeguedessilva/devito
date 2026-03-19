@@ -1444,6 +1444,42 @@ class TestLoopScheduling:
             # Fission happened
             assert i[exp_depth].dim is exp_dim
 
+    def test_fission_for_parallelism_b(self):
+        so = 2
+        grid = Grid(shape=(10, 10, 10))
+        x, y, z = grid.dimensions
+
+        f0 = TimeFunction(name='f0', grid=grid, space_order=so, staggered=(x,))
+        f1 = TimeFunction(name='f1', grid=grid, space_order=so, staggered=(y,))
+
+        f2 = TimeFunction(name='f2', grid=grid, space_order=so, staggered=(x, z))
+        f3 = TimeFunction(name='f3', grid=grid, space_order=so, staggered=(y, z))
+
+        f4 = TimeFunction(name='f4', grid=grid, space_order=so, staggered=NODE)
+
+        eq0 = Eq(f2, f0.dz)
+        eq1 = Eq(f3, f1.dz)
+        eq2 = Eq(f4, f2 + f3)
+
+        op = Operator([eq0, eq1, eq2])
+
+        trees = retrieve_iteration_tree(op)
+
+        # First two equations should be fused for parallelism, but the third should be
+        # fissioned
+        assert len(trees) == 2
+        assert len(trees[0][-1].nodes[0].exprs) == 2
+        assert len(trees[1][-1].nodes[0].exprs) == 1
+
+        def check_expr_contents(expr, expected):
+            assert all(f.base in expr.expr_symbols for f in expected)
+
+        # Check expressions match equations
+        check_expr_contents(trees[0][-1].nodes[0].exprs[0], (f2, f0))
+        check_expr_contents(trees[0][-1].nodes[0].exprs[1], (f3, f1))
+
+        check_expr_contents(trees[1][-1].nodes[0].exprs[0], (f4, f2, f3))
+
     @pytest.mark.parametrize('exprs', [
         # 0) Storage related dependence
         ('Eq(u.forward, v)', 'Eq(v, u.dxl)'),
@@ -1485,7 +1521,7 @@ class TestLoopScheduling:
         (('Eq(ti0[x,y,z], ti0[x,y,z] + ti1[x,y,z])',
           'Eq(ti1[x,y,z], ti3[x,y,z])',
           'Eq(ti3[x,y,z], ti1[x,y,z+1] + 1.)'),
-         '+++++', ['xyz', 'xyz', 'xyz'], 'xyzzz'),
+         '++++', ['xyz', 'xyz'], 'xyzz'),
         # 1) WAR 1->2, 2->3
         (('Eq(ti0[x,y,z], ti0[x,y,z] + ti1[x,y,z])',
           'Eq(ti1[x,y,z], ti0[x,y,z+1])',
@@ -1533,7 +1569,7 @@ class TestLoopScheduling:
         (('Eq(tu[t,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x,y,z-2])',
           'Eq(tw[t,x,y,z], tv[t,x,y+1,z] + 1.)'),
-         '++++++++', ['txyz', 'txyz', 'txyz'], 'txyzyzyz'),
+         '+++++++', ['txyz', 'txyz', 'txyz'], 'txyzzyz'),
         # 10) WAR 1->2; WAW 1->3
         (('Eq(tu[t-1,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x,y,z+2])',
@@ -1593,6 +1629,15 @@ class TestLoopScheduling:
           'Eq(tu[t+1,xi,yi,zi], tv[t+1,xi,yi,zi] + tv[t+1,xi+1,yi,zi])',
           'Eq(tw[t+1,x,y,z], tv[t+1,x,y,z] + tv[t+1,x+1,y,z])'),
          '++++++++++', ['txyz', 'txyz', 'txyz'], 'txyzxyzxyz'),
+        # 20) RAW 1->3, WAR 2->3; expected=2
+        # It's important the split occurs after the second equation, since the
+        # first two can safely be fused together (previously, instead,
+        # due to an issue in `break_for_parallelism`, the eqns were split over
+        # three loop nests)
+        (('Eq(tu[t+1,x,y,z], tu[t,x,y,z] + tu[t,x+1,y,z])',
+          'Eq(tv[t+1,x,y,z], tv[t,x,y,z] + 1)',
+          'Eq(tw[t+1,x,y,z], tu[t+1,x+1,y,z] + tw[t,x+1,y,z] + tv[t+1,x+1,y,z])'),
+         '+++++++', ['txyz', 'txyz'], 'txyzxyz'),
     ])
     def test_consistency_anti_dependences(self, exprs, directions, expected, visit):
         """

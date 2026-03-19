@@ -1143,6 +1143,9 @@ class Function(DiscreteFunction):
             * 0 to non-staggered dimensions;
             * 1 to staggered dimensions.
         """
+        if isinstance(staggered, Staggering):
+            staggered = staggered._ref
+
         if not staggered:
             processed = ()
         elif staggered is CELL:
@@ -1154,6 +1157,8 @@ class Function(DiscreteFunction):
             assert len(staggered) == len(dimensions)
             processed = staggered
         else:
+            # Staggering is not NODE or CELL or None
+            # therefore it's a tuple of dimensions
             processed = []
             for d in dimensions:
                 if d in as_tuple(staggered):

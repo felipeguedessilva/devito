@@ -20,6 +20,18 @@ from devito.types.utils import NODE
 __all__ = ['TensorFunction', 'TensorTimeFunction', 'VectorFunction', 'VectorTimeFunction']
 
 
+def staggering(stagg, i, j, d, dims):
+    if stagg is None:
+        # No input
+        return NODE if i == j else (d, dims[j])
+    elif isinstance(stagg, (tuple, list)):
+        # User input as list or tuple
+        return stagg[i][j]
+    elif isinstance(stagg, AbstractTensor):
+        # From rebuild/tensor property. Indexed as a sympy Matrix
+        return stagg[i, j]
+
+
 class TensorFunction(AbstractTensor):
     """
     Tensor valued Function represented as a Matrix.
@@ -128,8 +140,7 @@ class TensorFunction(AbstractTensor):
             start = i if (symm or diag) else 0
             stop = i + 1 if diag else len(dims)
             for j in range(start, stop):
-                staggj = (stagg[i][j] if stagg is not None
-                          else (NODE if i == j else (d, dims[j])))
+                staggj = staggering(stagg, i, j, d, dims)
                 sub_kwargs = cls._component_kwargs((i, j), **kwargs)
                 sub_kwargs.update({'name': f"{name}_{d.name}{dims[j].name}",
                                    'staggered': staggj})

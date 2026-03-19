@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from test_dse import TestTTI
 
-from conftest import _R, assert_blocking, assert_structure
+from conftest import _R, assert_blocking, assert_structure, body0
 from devito import (
     NODE, Buffer, ConditionalDimension, Constant, CustomDimension, DefaultDimension,
     Dimension, Eq, Function, Grid, Inc, Ne, Operator, PrecomputedSparseFunction,
@@ -22,12 +22,6 @@ from devito.mpi.distributed import CustomTopology
 from devito.mpi.routines import ComputeCall, HaloUpdateCall, HaloUpdateList, MPICall
 from devito.tools import Bunch
 from examples.seismic.acoustic import acoustic_setup
-
-
-# Main body in Operator IET, depending on ISA
-def body0(op):
-    bidx = 0 if 'sse' not in configuration['platform'].known_isas else 1
-    return op.body.body[bidx]
 
 
 class TestDistributor:
@@ -1893,10 +1887,12 @@ class TestCodeGeneration:
     @pytest.mark.parallel(mode=1)
     def test_haloupdate_buffer1(self, mode):
         grid = Grid(shape=(4, 4))
-        x, y = grid.dimensions
 
-        u = TimeFunction(name='u', grid=grid, time_order=1, save=Buffer(1))
-        v = TimeFunction(name='v', grid=grid, time_order=1, save=Buffer(1))
+        # With order 2 (1) forward derivatives, the loops can (and will) be fused,
+        # removing the need for a halo update so space_order=4 is used to ensure
+        # derivatives are centred resulting in parallel loops and halo updates
+        u = TimeFunction(name='u', grid=grid, time_order=1, space_order=4, save=Buffer(1))
+        v = TimeFunction(name='v', grid=grid, time_order=1, space_order=4, save=Buffer(1))
 
         eqns = [Eq(u.forward, div(v) + 1.),
                 Eq(v.forward, div(u.forward) + 1.)]
@@ -1915,22 +1911,22 @@ class TestCodeGeneration:
     @pytest.mark.parallel(mode=1)
     @pytest.mark.parametrize('sz,fwd,expr,exp0,exp1,args', [
         (1, True, 'rec.interpolate(v2)', 3, 2, ('v1', 'v2')),
-        (1, True, 'Eq(v3.forward, v2.laplace + 1)', 1, 1, ('v2',)),
-        (1, True, 'Eq(v3.forward, v2.forward.laplace + 1)', 3, 2, ('v1', 'v2',)),
-        (2, True, 'Eq(v3.forward, v2.forward.laplace + 1)', 3, 2, ('v1', 'v2',)),
+        (1, True, 'Eq(v3.forward, v2.laplace + 1)', 3, 2, ('v1', 'v2')),
+        (1, True, 'Eq(v3.forward, v2.forward.laplace + 1)', 3, 2, ('v1', 'v2')),
+        (2, True, 'Eq(v3.forward, v2.forward.laplace + 1)', 3, 2, ('v1', 'v2')),
         (1, False, 'rec.interpolate(v2)', 3, 2, ('v1', 'v2')),
-        (1, False, 'Eq(v3.backward, v2.laplace + 1)', 1, 1, ('v2',)),
-        (1, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 2, ('v1', 'v2',)),
-        (2, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 2, ('v1', 'v2',)),
+        (1, False, 'Eq(v3.backward, v2.laplace + 1)', 3, 2, ('v1', 'v2')),
+        (1, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 3, ('v2', 'v1', 'v2')),
+        (2, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 3, ('v2', 'v1', 'v2')),
     ])
     def test_haloupdate_buffer_cases(self, sz, fwd, expr, exp0, exp1, args, mode):
         grid = Grid((65, 65, 65), topology=('*', 1, '*'))
 
-        v1 = TimeFunction(name='v1', grid=grid, space_order=2, time_order=1,
+        v1 = TimeFunction(name='v1', grid=grid, space_order=4, time_order=1,
                           save=Buffer(1))
-        v2 = TimeFunction(name='v2', grid=grid, space_order=2, time_order=1,
+        v2 = TimeFunction(name='v2', grid=grid, space_order=4, time_order=1,
                           save=Buffer(1))
-        v3 = TimeFunction(name='v3', grid=grid, space_order=2, time_order=1,  # noqa
+        v3 = TimeFunction(name='v3', grid=grid, space_order=4, time_order=1,  # noqa
                           save=Buffer(1))
 
         rec = SparseTimeFunction(name='rec', grid=grid, nt=500, npoint=65)  # noqa

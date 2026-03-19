@@ -121,6 +121,13 @@ class Schedule(Queue):
           Dimension in both Clusters.
     """
 
+    FISSION_THRESHOLD = 2
+    """
+    The maximum number of iteration Dimensions such that we consider fissioning
+    a sequence of Clusters to increase parallelism. IOW, if there are more than
+    this number of iteration Dimensions, we do not even try to fission.
+    """
+
     @timed_pass(name='schedule')
     def process(self, clusters):
         return self._process_fatd(clusters, 1)
@@ -134,7 +141,8 @@ class Schedule(Queue):
 
         # Take the innermost Dimension -- no other Clusters other than those in
         # `clusters` are supposed to share it
-        candidates = prefix[-1].dim._defines
+        dim = prefix[-1].dim
+        candidates = dim._defines
 
         scope = Scope(flatten(c.exprs for c in clusters))
 
@@ -157,7 +165,7 @@ class Schedule(Queue):
         # Schedule Clusters over different IterationSpaces if this increases
         # parallelism
         for i in range(1, len(clusters)):
-            if self._break_for_parallelism(scope, candidates, i):
+            if self._break_for_parallelism(scope, dim, i):
                 return self.callback(clusters[:i], prefix, clusters[i:] + backlog,
                                      candidates | known_break)
 
@@ -189,19 +197,39 @@ class Schedule(Queue):
 
         return processed + self.callback(backlog, prefix)
 
-    def _break_for_parallelism(self, scope, candidates, i):
+    def _break_for_parallelism(self, scope, dim, timestamp):
+        candidates = dim._defines
+
+        # Do not fission for data locality reasons if there's enough potential
+        # parallelism in the inner Dimensions
+        try:
+            ispace, = {e.ispace for e in scope.exprs[:timestamp]}
+            _, ispace1 = ispace.split(dim)
+            if len(ispace1.itdims) > self.FISSION_THRESHOLD:
+                return False
+        except ValueError:
+            pass
+
         # `test` will be True if there's at least one data-dependence that would
         # break parallelism
         test = False
-        for d in scope.d_from_access_gen(scope.a_query(i)):
-            if d.is_local or d.is_storage_related(candidates):
+        for dep in scope.d_all_gen():
+            if dep.timestamp > timestamp:
+                continue
+
+            if dep.is_local or dep.is_storage_related(candidates):
                 # Would break a dependence on storage
                 return False
-            if any(d.is_carried(i) for i in candidates):  # noqa: SIM102
-                if (d.is_flow and d.is_lex_negative) or (d.is_anti and d.is_lex_positive):
+
+            if any(dep.is_carried(i) for i in candidates):
+                test0 = dep.is_flow and dep.is_lex_negative
+                test1 = dep.is_anti and dep.is_lex_positive
+                if test0 or test1:
                     # Would break a data dependence
                     return False
-            test = test or (bool(d.cause & candidates) and not d.is_lex_equal)
+
+            test = test or (bool(dep.cause & candidates) and not dep.is_lex_equal)
+
         return test
 
 
@@ -226,6 +254,7 @@ def guard(clusters):
 
             # Chain together all `cds` conditions from all expressions in `c`
             guards = {}
+            mode = sympy.Or
             for cd in cds:
                 # `BOTTOM` parent implies a guard that lives outside of
                 # any iteration space, which corresponds to the placeholder None
@@ -242,6 +271,7 @@ def guard(clusters):
 
                 # Pull `cd` from any expr
                 condition = guards.setdefault(k, [])
+                mode = mode and cd.relation
                 for e in exprs:
                     try:
                         condition.append(e.conditionals[cd])
@@ -256,7 +286,9 @@ def guard(clusters):
                     conditionals.pop(cd, None)
                     exprs[i] = e.func(*e.args, conditionals=conditionals)
 
-            guards = {d: sympy.And(*v, evaluate=False) for d, v in guards.items()}
+            # Combination `mode` is And by default.
+            # If all conditions are Or then Or combination `mode` is used.
+            guards = {d: mode(*v, evaluate=False) for d, v in guards.items()}
 
             # Construct a guarded Cluster
             processed.append(c.rebuild(exprs=exprs, guards=guards))

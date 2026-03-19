@@ -1,5 +1,6 @@
 import abc
 import inspect
+import warnings
 from contextlib import suppress
 from ctypes import POINTER, Structure, _Pointer, c_char, c_char_p
 from functools import cached_property, reduce
@@ -9,6 +10,7 @@ import numpy as np
 import sympy
 from sympy.core.assumptions import _assume_rules
 from sympy.core.decorators import call_highest_priority
+from sympy.utilities.exceptions import SymPyDeprecationWarning
 
 from devito.data import default_allocator
 from devito.parameters import configuration
@@ -914,6 +916,10 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
             return nopadding
         d = self.space_dimensions[-1]
 
+        # Last space Dimension is not the most inner Dimension
+        if d != self.dimensions[-1]:
+            return nopadding
+
         mmts = configuration['platform'].max_mem_trans_size(self.__padding_dtype__)
         remainder = self._size_nopad[d] % mmts
         if remainder == 0:
@@ -1533,9 +1539,19 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
         # This is used internally by sympy to process arguments at rebuilt. And since
         # some of our properties are non-sympyfiable we need to have a fallback
         try:
-            return super()._sympify(arg)
-        except sympy.SympifyError:
+            # Pure sympy object
+            return arg._sympy_()
+        except AttributeError:
             return arg
+
+    @classmethod
+    def _eval_from_dok(cls, rows, cols, dok):
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=SymPyDeprecationWarning
+            )
+            return super()._eval_from_dok(rows, cols, dok)
 
     @property
     def grid(self):
@@ -1573,7 +1589,7 @@ class AbstractTensor(sympy.ImmutableDenseMatrix, Basic, Pickable, Evaluable):
         comps = [f.func(*args, name=f.name.replace(self.name, newname), **kwargs)
                  for f in self.flat()]
         # Rebuild the matrix with the new components
-        return self._new(comps)
+        return self._new(*self.shape, comps)
 
     func = _rebuild
 
@@ -1937,8 +1953,17 @@ class LocalType(Basic):
         return self._liveness == 'lazy'
 
     """
-    A modifier added to the subclass C declaration when it appears
-    in a function signature. For example, a subclass might define `_C_modifier = '&'`
+    A modifier added to the declaration of the LocalType when it appears in a
+    function signature. For example, a subclass might define `_C_modifier = '&'`
     to impose pass-by-reference semantics.
     """
     _C_modifier = None
+
+    """
+    One or more optional keywords added to the declaration of the LocalType
+    in between the type and the variable name when it appears in a function
+    signature. For example, some languages support these to modify the way
+    the compiler generates code for passing the parameter and how the
+    runtime accesses it.
+    """
+    _C_tag = None

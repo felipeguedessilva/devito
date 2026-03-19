@@ -57,6 +57,15 @@ class Staggering(DimensionTuple):
     def on_node(self):
         return not self or all(s == 0 for s in self)
 
+    @property
+    def _ref(self):
+        if not self:
+            return None
+        elif self.on_node:
+            return NODE
+        else:
+            return tuple(d for d, s in zip(self.getters, self, strict=True) if s == 1)
+
 
 class IgnoreDimSort(tuple):
     """A tuple subclass used to wrap the implicit_dims to indicate

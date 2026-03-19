@@ -58,8 +58,8 @@ def test_func_of_indices():
 
 
 @pytest.mark.parametrize('dtype,expected', [
-    (np.float32, "float r0 = 1.0F/h_x;"),
-    (np.float64, "double r0 = 1.0/h_x;")
+    (np.float32, "const float r0 = 1.0F/h_x;"),
+    (np.float64, "const double r0 = 1.0/h_x;")
 ])
 def test_floatification_issue_1627(dtype, expected):
     """
@@ -426,6 +426,31 @@ def test_namespace():
 
     # Free symbols
     assert not ns0.free_symbols
+
+
+def test_list_initializer():
+    # Legacy interface
+    init0 = ListInitializer((1, 2, 3))
+    assert str(init0) == '{1, 2, 3}'
+
+    init1 = ListInitializer(1, 2, 3)
+    assert str(init1) == '{1, 2, 3}'
+
+    # Test hashing and equality
+    assert init0 == init1
+    assert hash(init0) == hash(init1)
+    init2 = ListInitializer(1, 2)
+    assert init0 != init2
+    assert hash(init0) != hash(init2)
+    assert hash(init0) == hash(init1)
+
+    # Reconstruction
+    assert init0 == init0._rebuild()
+    assert init1 == init1._rebuild()
+    assert str(init1._rebuild(4, 5)) == '{4, 5}'
+
+    # Accept `evaluate` but gently ignore it
+    assert str(ListInitializer((1, 2), evaluate=True)) == '{1, 2}'
 
 
 def test_rvalue():
@@ -881,7 +906,7 @@ class TestUxreplace:
 
         w_sub = uxreplace(w_lowered, {h_x: Number(3)})
 
-        assert np.isclose(w_sub, -0.003935689)
+        assert np.isclose(float(w_sub), -0.003935689)
         assert not w_sub.is_Mul
         assert w_sub.is_Number
 

@@ -92,9 +92,11 @@ class IREq(sympy.Eq, Pickable):
         if not self.is_Reduction:
             return super().__repr__()
         elif self.operation is OpInc:
-            return f'{self.lhs} += {self.rhs}'
+            return f'Inc({self.lhs}, {self.rhs})'
         else:
-            return f'{self.lhs} = {self.operation}({self.rhs})'
+            return f'Eq({self.lhs}, {self.operation}({self.rhs}))'
+
+    __str__ = __repr__
 
     # Pickling support
     __reduce_ex__ = Pickable.__reduce_ex__
@@ -223,7 +225,7 @@ class LoweredEq(IREq):
             else:
                 cond = diff2sympy(lower_exprs(d.condition))
                 if d._factor is not None:
-                    cond = sympy.And(cond, GuardFactor(d))
+                    cond = d.relation(cond, GuardFactor(d))
                 conditionals[d] = cond
             # Replace dimension with index
             index = d.index
