@@ -2,7 +2,6 @@ from functools import cached_property
 
 import numpy as np
 import pytest
-from test_dse import TestTTI
 
 from conftest import _R, assert_blocking, assert_structure, body0
 from devito import (
@@ -17,6 +16,7 @@ from devito.data import LEFT, RIGHT
 from devito.ir.iet import (
     Call, Conditional, FindNodes, FindSymbols, Iteration, retrieve_iteration_tree
 )
+from devito.ir.support.space import Backward, Forward
 from devito.mpi import MPI
 from devito.mpi.distributed import CustomTopology
 from devito.mpi.routines import ComputeCall, HaloUpdateCall, HaloUpdateList, MPICall
@@ -1916,8 +1916,8 @@ class TestCodeGeneration:
         (2, True, 'Eq(v3.forward, v2.forward.laplace + 1)', 3, 2, ('v1', 'v2')),
         (1, False, 'rec.interpolate(v2)', 3, 2, ('v1', 'v2')),
         (1, False, 'Eq(v3.backward, v2.laplace + 1)', 3, 2, ('v1', 'v2')),
-        (1, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 3, ('v2', 'v1', 'v2')),
-        (2, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 3, ('v2', 'v1', 'v2')),
+        (1, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 2, ('v1', 'v2')),
+        (2, False, 'Eq(v3.backward, v2.backward.laplace + 1)', 3, 2, ('v1', 'v2')),
     ])
     def test_haloupdate_buffer_cases(self, sz, fwd, expr, exp0, exp1, args, mode):
         grid = Grid((65, 65, 65), topology=('*', 1, '*'))
@@ -1942,6 +1942,12 @@ class TestCodeGeneration:
 
         op = Operator(eqns)
         _ = op.cfunction
+
+        # Check for time loop direction
+        trees = retrieve_iteration_tree(op)
+        direction = Forward if fwd else Backward
+        for tree in trees:
+            assert tree[0].direction == direction
 
         calls, _ = check_halo_exchanges(op, exp0, exp1)
         for i, v in enumerate(args):
@@ -2173,6 +2179,76 @@ class TestCodeGeneration:
         expected = [nx * ny * max(t-1, 0) for t in range(0, nt, 2)]
         assert np.allclose(g.data, expected)
         assert np.allclose(h.data, expected)
+
+    @pytest.mark.parallel(mode=1)
+    def test_lift_halo_update_outside_distributed(self, mode):
+        grid = Grid(shape=(28, 28, 28))
+        x, _, _ = grid.dimensions
+        h_x = x.spacing
+
+        vx = TimeFunction(name="vx", grid=grid, space_order=4, time_order=1)
+        vy = TimeFunction(name="vy", grid=grid, space_order=4, time_order=1)
+        vz = TimeFunction(name="vz", grid=grid, space_order=4, time_order=1)
+
+        eqn = Eq(vz, vz.dy + vz.dx(x0=x - 5.*h_x) + (vx.dy + vy.dx).dx.dy + vz)
+
+        # Ensure the Operator can be constructed and jit-compiled correctly
+        op = Operator(eqn)
+        _ = op.cfunction
+
+        # Check generated code -- expected one halo exchange exactly at the top
+        # of the time loop
+        tloop = get_time_loop(op)
+        halo_update = tloop.nodes[0].body[0].body[0].body[0]
+        assert isinstance(halo_update, HaloUpdateList)
+
+    @pytest.mark.parallel(mode=4)
+    def test_halo_inner_dim(self, mode):
+        grid = Grid((11, 11, 11))
+
+        np.random.seed(0)
+        v = TimeFunction(name="v", grid=grid, space_order=4,
+                         time_order=1, save=Buffer(1))
+        v.data[:] = np.random.randn(*grid.shape)
+        e = TimeFunction(name="dummy", grid=grid, space_order=4, time_order=0)
+
+        eq = [Eq(v.forward, v + 1), Eq(e, v.forward.dydz)]
+
+        op = Operator(eq, opt=('advanced', {'blocklevels': 0}))
+
+        assert_structure(op, ['txyz', 't', 'txyz', 'txyz'], 'txyzxyzz')
+        op(time=100)
+
+        assert np.isclose(norm(e), 23484.863, rtol=0, atol=1e-1)
+
+    @pytest.mark.parallel(mode=[(1, 'overlap2')])
+    def test_merge_subset_comms_w_overlap(self, mode):
+        grid = Grid(shape=(50, 50, 50))
+
+        f = Function(name='f', grid=grid, space_order=8)
+        g = f.func(name='g')
+        u = TimeFunction(name='u', grid=grid, time_order=2, space_order=8,
+                         save=Buffer(2))
+
+        eqns = [
+            Eq(f, u.dx),
+            Eq(g, u.dy),
+            Eq(u.forward, u + u.backward + u.laplace + f + g.dx),
+        ]
+
+        op = Operator(eqns)
+
+        _ = op.cfunction
+
+        # Check generated code -- expected one halo exchange for `u` before
+        # the first set of loops within `tloop`, and one halo exchange for `g`
+        # before the second set of loops
+        tloop = get_time_loop(op)
+        body = tloop.nodes[0].body[0].body
+        halo_update0 = body[0].body[0]
+        assert isinstance(halo_update0, HaloUpdateList)
+        halo_update1 = body[1].body[0]
+        assert isinstance(halo_update1, HaloUpdateList)
 
 
 class TestOperatorAdvanced:
@@ -2705,9 +2781,10 @@ class TestOperatorAdvanced:
 
         titer = op.body.body[-1].body[0]
         assert titer.dim is grid.time_dim
-        assert titer.nodes[0].body[0].body[0].is_List
-        assert len(titer.nodes[0].body[0].body[0].body[0].body) == 1
-        assert titer.nodes[0].body[0].body[0].body[0].body[0].is_Call
+        block = titer.nodes[0].body[0].body[1]
+        assert block.is_List
+        assert len(block.body) == 3
+        assert block.body[0].body[0].is_Call
 
         op.apply(time=0)
 
@@ -3110,7 +3187,7 @@ class TestOperatorAdvanced:
         assert_structure(op1, ['t',
                                't,x0_blk0,y0_blk0,x,y,z',
                                't,x0_blk0,y0_blk0,x,y,z'],
-                         't,x0_blk0,y0_blk0,x,y,z,z')
+                         'tx0_blk0y0_blk0xyzz')
 
         def init(f, v=1):
             f.data[:] = np.indices(grid.shape).sum(axis=0) % (.004*v) + .01
@@ -3484,9 +3561,9 @@ class TestElasticLike:
 
 class TestTTIOp:
 
-    @pytest.mark.skipif(TestTTI is None, reason="Requires installing the tests")
     @pytest.mark.parallel(mode=1)
     def test_halo_structure(self, mode):
+        from test_dse import TestTTI
         solver = TestTTI().tti_operator(opt='advanced', space_order=8)
         op = solver.op_fwd(save=False)
 

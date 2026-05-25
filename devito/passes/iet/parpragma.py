@@ -54,6 +54,10 @@ class PragmaSimdTransformer(PragmaTransformer):
     def _support_complex_reduction(cls, compiler):
         return False
 
+    @classmethod
+    def _support_nested_parallelism(cls, compiler):
+        return False
+
     @property
     def simd_reg_nbytes(self):
         return self.platform.simd_reg_nbytes
@@ -225,9 +229,9 @@ class PragmaShmTransformer(ShmTransformer, PragmaSimdTransformer):
     IETs for CPUs.
     """
 
-    def __init__(self, sregistry, options, platform, compiler):
+    def __init__(self, **kwargs):
         key = lambda i: i.is_ParallelRelaxed and not i.is_Vectorized
-        super().__init__(key, sregistry, options, platform, compiler)
+        super().__init__(key, **kwargs)
 
     def _make_reductions(self, partree):
         if not any(i.is_ParallelAtomic for i in partree.collapsed):
@@ -342,6 +346,15 @@ class PragmaShmTransformer(ShmTransformer, PragmaSimdTransformer):
     def _make_guard(self, parregion):
         return parregion
 
+    def _support_uindices(self, uindices):
+        if not uindices:
+            # No secondary indices, so we can apply nested parallelism
+            return True
+        else:
+            # Compiler supports nested parallelism with multiple indices
+            # such as for(int i = 0, j=1; ...)
+            return self._support_nested_parallelism(self.compiler)
+
     def _make_nested_partree(self, partree):
         # Apply heuristic
         if self.nhyperthreads <= self.nested:
@@ -366,7 +379,8 @@ class PragmaShmTransformer(ShmTransformer, PragmaSimdTransformer):
             # within a block)
             candidates = []
             for i in inner:
-                if self.key(i) and any((j.dim.root is i.dim.root) for j in outer):
+                if self.key(i) and any((j.dim.root is i.dim.root) for j in outer) and \
+                   self._support_uindices(i.uindices):
                     candidates.append(i)
                 elif candidates:
                     # If there's at least one candidate but `i` doesn't honor the
@@ -491,8 +505,8 @@ class PragmaDeviceAwareTransformer(DeviceAwareMixin, PragmaShmTransformer):
     shared-memory-parallel, and device-parallel IETs.
     """
 
-    def __init__(self, sregistry, options, platform, compiler):
-        super().__init__(sregistry, options, platform, compiler)
+    def __init__(self, options=None, **kwargs):
+        super().__init__(options=options, **kwargs)
 
         self.gpu_fit = options['gpu-fit']
         # Need to reset the tile in case was already used and iter over by blocking

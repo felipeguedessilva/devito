@@ -38,6 +38,7 @@ from devito.tools import flatten, powerset, timed_region
 from devito.types import (
     Array, Barrier, ConditionalDimension, CustomDimension, Indirection, Scalar, Symbol
 )
+from devito.warnings import DevitoWarning
 
 
 def dimify(dimensions):
@@ -1315,6 +1316,50 @@ class TestApplyArguments:
         # But the following should work perfectly fine
         op.arguments(x_size=2, y_size=2)
 
+    @pytest.mark.parametrize('vfact', [1, 3, 4])
+    def test_apply_args_consitency(self, vfact):
+        nt = 201
+        grid = Grid(shape=(11, 11, 11))
+        time = grid.time_dim
+
+        u = TimeFunction(name='u', grid=grid, time_order=2, space_order=4)
+        rec = SparseTimeFunction(name='rec', grid=grid, npoint=1, nt=nt)
+
+        factor = Constant(name='factor', value=vfact, dtype=np.int32)
+        time_sub = ConditionalDimension(name='t_sub', parent=time, factor=factor)
+        usave = TimeFunction(name='usave', grid=grid, space_order=4, time_order=0,
+                             save=nt, time_dim=time_sub)
+
+        eqns = [
+            Eq(u.forward, u + 1),
+            Eq(usave, u),
+        ] + rec.interpolate(expr=u)
+
+        op = Operator(eqns, opt='noop')
+        args0 = op.arguments(time_m=0, time_M=nt-2)
+        args1 = op.arguments(time_m=0, time_M=nt-2, rec=rec, usave=usave)
+
+        for k, v in args0.items():
+            assert k in args1
+            if isinstance(v, int):
+                assert args1[k] == v
+
+    def test_warn_if_shrunk_spacedim_bounds(self):
+        grid = Grid(shape=(20, 20))
+
+        f = Function(name='f', grid=grid, space_order=0)
+        u = TimeFunction(name='u', grid=grid, space_order=8)
+
+        eq = Eq(u.forward, u + (u*f).laplace)
+
+        op = Operator(eq)
+
+        u.data[:] = 2.
+        f.data[:] = 3.
+
+        with pytest.warns(DevitoWarning, match="Shrinking bounds*"):
+            op.apply(time_M=3)
+
 
 @skipif('device')
 class TestDeclarator:
@@ -1554,12 +1599,12 @@ class TestLoopScheduling:
         (('Eq(tu[t,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x,y,z+2])',
           'Eq(tu[t,x,y,0], tu[t,x,y,0] + 1.)'),
-         '+++++', ['txyz', 'txyz', 'txy'], 'txyzz'),
+         '+++++++', ['txyz', 'txyz', 'txy'], 'txyzxyz'),
         # 7) WAR 1->2, 2->3
         (('Eq(tu[t,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x,y,z+2])',
           'Eq(tw[t,x,y,z], tv[t,x,y,z-1] + 1.)'),
-         '++++++', ['txyz', 'txyz', 'txyz'], 'txyzzz'),
+         '++++++++', ['txyz', 'txyz', 'txyz'], 'txyzxyzz'),
         # 8) WAR 1->2; WAW 1->3
         (('Eq(tu[t,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x+2,y,z])',
@@ -1569,7 +1614,7 @@ class TestLoopScheduling:
         (('Eq(tu[t,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x,y,z-2])',
           'Eq(tw[t,x,y,z], tv[t,x,y+1,z] + 1.)'),
-         '+++++++', ['txyz', 'txyz', 'txyz'], 'txyzzyz'),
+         '+++++++++', ['txyz', 'txyz', 'txyz'], 'txyzxyzyz'),
         # 10) WAR 1->2; WAW 1->3
         (('Eq(tu[t-1,x,y,z], tu[t,x,y,z] + tv[t,x,y,z])',
           'Eq(tv[t,x,y,z], tu[t,x,y,z+2])',

@@ -1095,8 +1095,6 @@ class Function(DiscreteFunction):
         interp_order = kwargs.get('interp_order', 2)
         if not is_integer(interp_order):
             raise TypeError("`interp_order` must be an integer")
-        elif interp_order < 1:
-            raise ValueError("`interp_order` must be >= 2")
         elif interp_order > self._space_order and self._space_order > 1:
             raise ValueError("`interp_order` must be <= `space_order`")
         self._interp_order = interp_order
@@ -1121,14 +1119,15 @@ class Function(DiscreteFunction):
         return 1 if self.staggered.on_node else 2
 
     def _eval_at(self, func):
-        if self.staggered == func.staggered:
+        if self.staggered == func.staggered or self.interp_order == 0:
             return self
 
         mapper = {}
         for d in self.dimensions:
             try:
                 if self.indices_ref[d] is not func.indices_ref[d]:
-                    f_idx = func.indices_ref[d]._subs(func.dimensions[d], d)
+                    d0 = func.dimensions.get(d, d)
+                    f_idx = func.indices_ref[d]._subs(d0, d)
                     mapper[self.indices_ref[d]] = f_idx
             except KeyError:
                 pass
@@ -1592,15 +1591,6 @@ class TimeFunction(Function):
     @property
     def _time_buffering_default(self):
         return self._time_buffering and not isinstance(self.save, Buffer)
-
-    def _evaluate(self, **kwargs):
-        retval = super()._evaluate(**kwargs)
-        if not self._time_buffering and not retval.is_Function:
-            # Saved TimeFunction might need streaming, expand interpolations
-            # for easier processing
-            return retval.evaluate
-        else:
-            return retval
 
     def _arg_check(self, args, intervals, **kwargs):
         super()._arg_check(args, intervals, **kwargs)

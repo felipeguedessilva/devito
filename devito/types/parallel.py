@@ -14,7 +14,7 @@ import numpy as np
 
 from devito.exceptions import InvalidArgument
 from devito.parameters import configuration
-from devito.symbolics import search
+from devito.symbolics import AlignedAccess, Terminal, search
 from devito.tools import as_list, as_tuple, is_integer
 from devito.types.array import Array, ArrayObject
 from devito.types.basic import Scalar, Symbol
@@ -35,7 +35,9 @@ __all__ = [
     'QueueID',
     'SharedData',
     'TBArray',
+    'TensorMove',
     'ThreadArray',
+    'ThreadArrive',
     'ThreadCommit',
     'ThreadID',
     'ThreadPoolSync',
@@ -365,12 +367,24 @@ class ThreadCommit(Fence):
     pass
 
 
+class ThreadArrive(Fence):
+
+    """
+    A generic arrive operation for a single thread, typically used to signal
+    the arrival at a certain point through a suitable synchronization object.
+    """
+
+    pass
+
+
 class ThreadWait(Fence):
 
     """
     A generic wait operation for a single thread, typically used to synchronize
-    after a memory operation issued at a specific program point with a
-    ThreadCommit operation.
+    with other threads over:
+
+        * a memory operation issued by a prior ThreadCommit operation.
+        * the consumption of a shared resource via a ThreadArrive operation.
     """
 
     pass
@@ -386,3 +400,49 @@ class TBArray(Array):
         kwargs['liveness'] = 'eager'
 
         super().__init_finalize__(*args, **kwargs)
+
+
+class TensorMove(AlignedAccess, Terminal):
+
+    """
+    Represent the LOAD/STORE of a multi-dimensional block of data from/to a higher
+    level of the memory hierarchy.
+
+    Parameters
+    ----------
+    base : IndexedBase
+        The base of the AbstractFunction subject of the TensorMove.
+    tid0 : Dimension
+        A representation of thread(s) issuing the TensorMove.
+    coords : tuple
+        The base address of the TensorMove (one point per Dimension).
+    """
+
+    __rargs__ = ('base', 'tid0', 'coords')
+
+    _expected_alignment = 16
+    """
+    The expected alignment in bytes for the underlying LOAD/STORE operation.
+    """
+
+    def __new__(cls, base, tid0, coords, **kwargs):
+        return super().__new__(cls, base, tid0, coords)
+
+    @property
+    def tid0(self):
+        return self.args[1]
+
+    @property
+    def coords(self):
+        return self.args[2]
+
+    @cached_property
+    def indexed(self):
+        return self.function[self.coords]
+
+    @property
+    def ndim(self):
+        return self.function.ndim
+
+    def _ccode(self, printer):
+        return str(self)

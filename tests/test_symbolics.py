@@ -8,7 +8,7 @@ from sympy import And, Expr, Number, Symbol, true
 from devito import (  # noqa
     Abs, Conj, Constant, Dimension, Eq, Function, Ge, Grid, Gt, Imag, Le, Lt, Max, Min,
     Operator, Real, SubDimension, SubDomain, TimeFunction, configuration, cos, norm, sin,
-    solve
+    solve, switchconfig
 )
 from devito.finite_differences.differentiable import Mul, SafeInv, Weights
 from devito.ir import Expression, FindNodes, ccode
@@ -16,11 +16,11 @@ from devito.ir.support.guards import GuardExpr, pairwise_or, simplify_and
 from devito.mpi.halo_scheme import HaloTouch
 from devito.symbolics import (  # noqa
     INT, BaseCast, CallFromPointer, Cast, DefFunction, FieldFromComposite,
-    FieldFromPointer, IntDiv, ListInitializer, Namespace, ReservedWord, Rvalue, SizeOf,
-    VectorAccess, evalrel, pow_to_mul, retrieve_derivatives, retrieve_functions,
+    FieldFromPointer, IntDiv, ListInitializer, Namespace, ReservedWord, RoundUp, Rvalue,
+    SizeOf, VectorAccess, evalrel, pow_to_mul, retrieve_derivatives, retrieve_functions,
     retrieve_indexed, uxreplace
 )
-from devito.tools import CustomDtype, as_tuple
+from devito.tools import CustomDtype, as_tuple, dtypes_vector_mapper
 from devito.types import (
     Array, Bundle, ComponentAccess, FIndexed, LocalObject, Object, StencilDimension
 )
@@ -130,6 +130,24 @@ def test_real():
         s = dSymbol(name='s', dtype=dtype)
         assert s.is_real is not np.iscomplexobj(dtype(0))
         assert s.is_imaginary is np.iscomplexobj(dtype(0))
+
+
+@pytest.mark.parametrize('spacing, extent, shape, expected, broken', [
+    ((0.5, 0.5), None, (11, 11), ((0.5, 0.5), (5.0, 5.0)), False),
+    (None, (5.0, 5.0), (11, 11), ((0.5, 0.5), (5.0, 5.0)), False),
+    ((0.5, 0.5), (5.0, 5.0), (11, 11), ((0.5, 0.5), (5.0, 5.0)), False),
+    (None, (.3, .3), (151, 146), ((0.002, 0.002), (.3, .3)), 'spacing'),
+    ((.002, .002), (.3, .3), (151, 146), ((0.002, 0.002), (.3, .3)), False),
+    ((.002, .002), None, (151, 146), ((0.002, 0.002), (.3, .3)), 'extent'),
+    (None, None, (11, 11), ((.1, .1), (1.0, 1.0)), False),
+])
+def test_grid_inputs(spacing, extent, shape, expected, broken):
+    grid = Grid(shape=shape, spacing=spacing, extent=extent)
+    sp, ex = expected
+    sp = np.array(sp).astype(grid.dtype)
+    ex = np.array(ex).astype(grid.dtype)
+    assert np.allclose(grid.spacing, sp, atol=0, rtol=0) is (broken != 'spacing')
+    assert np.allclose(grid.extent, ex, atol=0, rtol=0) is (broken != 'extent')
 
 
 def test_constant():
@@ -390,6 +408,20 @@ def test_safeinv():
     assert str(v) == 'u[x, y]'
 
 
+def test_roundup():
+    grid = Grid(shape=(11, 11))
+    u = Function(name='u', grid=grid)
+    a = dSymbol('a', dtype=np.int32)
+
+    expr = RoundUp(a, 16)
+    with switchconfig(platform='bdw', language='openmp'):
+        op = Operator(Eq(u, u + expr))
+
+    assert ccode(expr) == 'ROUND_UP(a, 16)'
+    assert '#define ROUND_UP(a,b)' in str(op)
+    assert 'ROUND_UP(a, 16)' in str(op)
+
+
 def test_def_function():
     foo0 = DefFunction('foo', arguments=['a', 'b'], template=['int'])
     foo1 = DefFunction('foo', arguments=['a', 'b'], template=['int'])
@@ -541,6 +573,13 @@ def test_component_access():
     cf2 = cf1.func(*cf1.args)
     assert cf2.index == cf1.index
     assert cf2 == cf1
+
+
+def test_component_access_symbol_printing():
+    acc = dSymbol(name='acc', dtype=dtypes_vector_mapper[(np.float32, 4)])
+    expr = ComponentAccess(acc, 0)
+
+    assert ccode(sympy.Float('1.25')*expr, dtype=expr.dtype) == '1.250F*acc.x'
 
 
 def test_vector_access():

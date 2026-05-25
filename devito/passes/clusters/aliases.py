@@ -140,6 +140,10 @@ class CireTransformer:
         schedule, exprs = self._select(variants)
 
         # Schedule -> Schedule (optimization)
+        if self.opt_maxpar:
+            schedule = optimize_schedule_maxpar(schedule)
+
+        # Schedule -> Schedule (optimization)
         if self.opt_rotate:
             schedule = optimize_schedule_rotations(schedule, self.sregistry)
 
@@ -292,14 +296,15 @@ class CireInvariants(CireTransformerLegacy, Queue):
     def callback(self, clusters, prefix, xtracted=None):
         if not prefix:
             return clusters
-        d = prefix[-1].dim
+        p = prefix[-1]
+        d = p.dim
 
         # Rule out extractions that would break data dependencies
         exclude = set().union(*[c.scope.writes for c in clusters])
 
         # Rule out extractions that depend on the Dimension currently investigated,
         # as they clearly wouldn't be invariants
-        exclude.add(d)
+        exclude.update({d, *p.sub_iterators})
 
         key = lambda c: self._lookup_key(c, d)
         processed = list(clusters)
@@ -663,7 +668,6 @@ def lower_aliases(aliases, meta, maxpar):
     """
     Create a Schedule from an AliasList.
     """
-    stampcache = {}
     dmapper = {}
     processed = []
     for a in aliases:
@@ -702,12 +706,6 @@ def lower_aliases(aliases, meta, maxpar):
             # `i=x[0,0]<1>` and `interval=x[-4,4]<0>`; here we need to
             # use `<1>` as stamp, which is what appears in `ispace`
             interval = interval.lift(i.stamp)
-
-            # We further bump the interval stamp if we were requested to trade
-            # fusion for more collapse-parallelism
-            if maxpar:
-                stamp = stampcache.setdefault(interval.dim, Stamp())
-                interval = interval.lift(stamp)
 
             writeto.append(interval)
             intervals.append(interval)
@@ -850,6 +848,30 @@ def optimize_schedule_rotations(schedule, sregistry):
         rmapper[d].extend(list(mapper.values()))
 
     return schedule.rebuild(*processed, rmapper=rmapper)
+
+
+def optimize_schedule_maxpar(schedule):
+    """
+    Bump the IterationSpace' stamp trading fusion for more collapse-parallelism.
+    """
+    key = lambda i: (i.writeto, i.ispace)
+
+    processed = []
+    for (writeto0, ispace0), group in groupby(schedule, key=key):
+        g = list(group)
+
+        stamp = Stamp()
+        dims = writeto0.itdims
+
+        writeto = writeto0.lift(dims, stamp)
+        ispace = ispace0.lift(dims, stamp)
+
+        processed.extend([
+            ScheduledAlias(pivot, writeto, ispace, aliaseds, indicess)
+            for pivot, _, _, aliaseds, indicess in g
+        ])
+
+    return schedule.rebuild(*processed)
 
 
 def lower_schedule(schedule, meta, sregistry, opt_ftemps, opt_min_dtype,

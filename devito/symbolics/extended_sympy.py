@@ -3,6 +3,7 @@ Extended SymPy hierarchy.
 """
 import re
 from contextlib import suppress
+from functools import cached_property
 
 import numpy as np
 import sympy
@@ -23,9 +24,9 @@ __all__ = ['CondEq', 'CondNe', 'BitwiseNot', 'BitwiseXor', 'BitwiseAnd',  # noqa
            'CallFromComposite', 'FieldFromPointer', 'FieldFromComposite',
            'ListInitializer', 'Byref', 'IndexedPointer', 'Cast', 'DefFunction',
            'MathFunction', 'InlineIf', 'Reserved', 'ReservedWord', 'Keyword',
-           'String', 'Macro', 'Class', 'MacroArgument', 'Deref', 'Namespace',
-           'Rvalue', 'Null', 'SizeOf', 'rfunc', 'BasicWrapperMixin', 'ValueLimit',
-           'VectorAccess']
+           'String', 'Macro', 'Class', 'MacroArgument', 'RoundUp', 'Deref',
+           'Namespace', 'Rvalue', 'Null', 'SizeOf', 'rfunc', 'BasicWrapperMixin',
+           'ValueLimit', 'AlignedAccess', 'VectorAccess']
 
 
 class CondEq(sympy.Eq):
@@ -118,6 +119,10 @@ class IntDiv(sympy.Expr):
             raise ValueError("Cannot divide by 0")
         elif rhs == 1 or rhs is None:
             return lhs
+
+        if is_integer(lhs) and is_integer(rhs):
+            # Both sides are plain integers -- perform the division right away
+            return lhs // rhs
 
         if not is_integer(rhs):
             # Perhaps it's a symbolic RHS -- but we wanna be sure it's of type int
@@ -623,6 +628,49 @@ class MacroArgument(sympy.Symbol):
     __repr__ = __str__
 
 
+class RoundUp(Function):
+
+    """
+    Symbolic representation of rounding a value up to the next multiple of a
+    given step.
+    """
+
+    def __new__(cls, value, step, **kwargs):
+        value = sympify(value)
+        step = sympify(step)
+
+        if not is_integer(step):
+            raise ValueError("`step` must be an integer")
+        if step < 1:
+            raise ValueError("Cannot round up with negative `step`")
+
+        if value.is_number and step.is_number:
+            remainder = value % step
+            if remainder == 0:
+                return value
+            else:
+                return value + step - remainder
+
+        return super().__new__(cls, value, step, **kwargs)
+
+    @property
+    def value(self):
+        return self.args[0]
+
+    @property
+    def step(self):
+        return self.args[1]
+
+    @property
+    def is_commutative(self):
+        return self.value.is_commutative and self.step.is_commutative
+
+    def __str__(self):
+        return f"ROUND_UP({self.value}, {self.step})"
+
+    __repr__ = __str__
+
+
 class ValueLimit(ReservedWord, sympy.Expr):
 
     """
@@ -841,7 +889,44 @@ class Rvalue(sympy.Expr, Pickable):
     __repr__ = __str__
 
 
-class VectorAccess(Expr, Pickable, BasicWrapperMixin):
+class AlignedAccess(Expr, Reserved, BasicWrapperMixin):
+
+    """
+    Abstract base class for an aligned access operation, that is an access to a
+    memory location that is guaranteed to be aligned to a certain byte
+    boundary.
+    """
+
+    @property
+    def _expected_alignment(self):
+        """
+        The expected alignment in bytes for the underlying LOAD/STORE operation.
+
+        To be implemented by subclasses.
+        """
+        raise NotImplementedError
+
+    @property
+    def _expected_alignment_elems(self):
+        """
+        The expected alignment in number of elements for the underlying
+        LOAD/STORE operation.
+        """
+        return self._expected_alignment // self.dtype().itemsize
+
+    @property
+    def base(self):
+        return self.args[0]
+
+    func = Reserved._rebuild
+
+    @cacheit
+    def sort_key(self, order=None):
+        # Ensure that the AlignedAccess is sorted as the base
+        return self.base.sort_key(order=order)
+
+
+class VectorAccess(AlignedAccess):
 
     """
     Represent a vector access operation at high-level.
@@ -855,20 +940,27 @@ class VectorAccess(Expr, Pickable, BasicWrapperMixin):
 
     __repr__ = __str__
 
-    func = Pickable._rebuild
-
-    @property
-    def base(self):
-        return self.args[0]
+    @cached_property
+    def _expected_alignment(self):
+        """
+        The expected alignment in bytes for the underlying LOAD/STORE operation.
+        """
+        mapper = {
+            # dtype==float => lowered with float4 => 4*4=16 bytes alignment;
+            np.float32: 16,
+            # dtype==half  => lowered with float2 => 2*4=8 bytes alignment;
+            np.float16: 8
+        }
+        try:
+            return mapper[self.function.dtype]
+        except KeyError as e:
+            raise ValueError from e(
+                f"Unsupported dtype `{self.function.dtype}` for VectorAccess"
+            )
 
     @property
     def indices(self):
         return self.base.indices
-
-    @cacheit
-    def sort_key(self, order=None):
-        # Ensure that the VectorAccess is sorted as the base
-        return self.base.sort_key(order=order)
 
 
 # Some other utility objects

@@ -43,6 +43,7 @@ from devito.tools import (
 )
 from devito.types import Buffer, Evaluable, device_layer, disk_layer, host_layer
 from devito.types.dimension import Thickness
+from devito.warnings import warn
 
 __all__ = ['Operator']
 
@@ -474,7 +475,7 @@ class Operator(Callable):
 
     @classmethod
     @timed_pass(name='lowering.IET')
-    def _lower_iet(cls, uiet, profiler=None, **kwargs):
+    def _lower_iet(cls, uiet, **kwargs):
         """
         Iteration/Expression tree lowering:
 
@@ -496,7 +497,7 @@ class Operator(Callable):
         # Instrument the IET for C-level profiling
         # Note: this is postponed until after _specialize_iet because during
         # specialization further Sections may be introduced
-        cls._Target.instrument(graph, profiler=profiler, **kwargs)
+        cls._Target.instrument(graph, **kwargs)
 
         # Extract the necessary macros from the symbolic objects
         generate_macros(graph, **kwargs)
@@ -603,11 +604,6 @@ class Operator(Callable):
                  if i.is_Derived and i.parent in nodes]
         toposort = DAG(nodes, edges).topological_sort()
 
-        futures = {}
-        for d in reversed(toposort):
-            if set(d._arg_names).intersection(kwargs):
-                futures.update(d._arg_values(self._dspace[d], args={}, **kwargs))
-
         # Prepare to process data-carriers
         args = kwargs['args'] = ReducerMap()
 
@@ -637,9 +633,6 @@ class Operator(Callable):
             for k, v in p._arg_values(estimate_memory=estimate_memory, **kwargs).items():
                 if k not in args:
                     args[k] = v
-                elif k in futures:
-                    # An explicit override is later going to set `args[k]`
-                    pass
                 elif k in kwargs:
                     # User is in control
                     # E.g., given a ConditionalDimension `t_sub` with factor `fact`
@@ -652,8 +645,11 @@ class Operator(Callable):
                         f"`{k}={v}`, while `{k}={args[k]}` is expected. Perhaps "
                         f"you forgot to override `{p}`?"
                     )
+                else:
+                    args[k] = args.unique(k, candidate=v)
 
-        args = kwargs['args'] = args.reduce_all()
+        args.reduce_inplace()
+        kwargs['args'] = args
 
         for i in discretizations:
             args.update(i._arg_values(**kwargs))
@@ -693,8 +689,15 @@ class Operator(Callable):
             p._arg_check(args, self._dspace[p], am=self._access_modes.get(p),
                          **kwargs)
         for d in self.dimensions:
+            try:
+                if d.is_Space and any(self._dspace[d].offsets):
+                    warn(f"Shrinking bounds (`{d.min_name}`, `{d.max_name}`); "
+                         f"some `{d}` points will not be computed. Likely "
+                         "insufficient space_order for the derivatives.")
+            except AttributeError:
+                pass
             if d.is_Derived:
-                d._arg_check(args, self._dspace[p])
+                d._arg_check(args)
 
         # Turn arguments into a format suitable for the generated code
         # E.g., instead of NumPy arrays for Functions, the generated code expects
@@ -711,11 +714,20 @@ class Operator(Callable):
 
         return args
 
-    def _postprocess_errors(self, retval):
+    def _postprocess_errors(self, retval, comm=None):
         if retval == 0:
             return
-        elif retval == error_mapper['Stability']:
+
+        # Math errors are not necessarily fatal, but they are a strong indication
+        # of an issue in the generated code, potentially a user-level one
+        if retval == error_mapper['Stability']:
             raise ExecutionError("Detected nan/inf in some output Functions")
+
+        if comm and comm is not MPI.COMM_NULL:
+            # A rank-local Python exception can leave peer ranks blocked inside
+            # generated MPI waits/exchanges. Abort the communicator instead of
+            # risking an indefinite hang.
+            comm.Abort(retval)
         elif retval == error_mapper['KernelLaunch']:
             raise ExecutionError("Kernel launch failed")
         elif retval == error_mapper['KernelLaunchOutOfResources']:
@@ -1013,7 +1025,7 @@ class Operator(Callable):
 
         with self._profiler.timer_on('arguments-postprocess'):
             # Perform error checking
-            self._postprocess_errors(retval)
+            self._postprocess_errors(retval, comm=args.comm)
             # Post-process runtime arguments
             self._postprocess_arguments(args, **kwargs)
 
@@ -1401,15 +1413,21 @@ class ArgumentsMap(dict):
             visible_device_var, visible_devices = get_visible_devices()
             if visible_devices is None:
                 return logical_deviceid
+            elif len(visible_devices) == 1:
+                # Only one visible device, it's clearly the one we want
+                return visible_devices[0]
+            elif logical_deviceid <= len(visible_devices):
+                # Map the logical device ID to the physical one
+                return visible_devices[logical_deviceid]
             else:
-                try:
-                    return visible_devices[logical_deviceid]
-                except IndexError as e:
-                    errmsg = (f"A deviceid value of {logical_deviceid} is not valid "
-                              f"with {visible_device_var}={visible_devices}. Note that "
-                              "deviceid corresponds to the logical index within the "
-                              "visible devices, not the physical device index.")
-                    raise ValueError(errmsg) from e
+                # Logical device ID is out of bounds, likely from oversubscription
+                # Print a warning and map modulo the number of visible devices
+                deviceid = visible_devices[logical_deviceid % len(visible_devices)]
+                warning(f"Logical device ID {logical_deviceid} is out of bounds "
+                        f"for {len(visible_devices)} visible devices"
+                        f" in {visible_device_var}."
+                        f"Mapping to device ID {deviceid} instead.")
+                return visible_devices[logical_deviceid % len(visible_devices)]
         else:
             return None
 

@@ -116,6 +116,8 @@ def sniff_mpi_distro(mpiexec):
             return 'MPICH'
         elif "Intel(R) MPI" in ver:
             return 'IntelMPI'
+        elif "IBM Spectrum MPI" in ver:
+            return "SpectrumMPI"
     except (CalledProcessError, UnicodeDecodeError):
         pass
     return 'unknown'
@@ -124,13 +126,15 @@ def sniff_mpi_distro(mpiexec):
 @memoized_func
 def sniff_mpi_flags(mpicc='mpicc'):
     mpi_distro = sniff_mpi_distro('mpiexec')
-    if mpi_distro != 'OpenMPI':
+    if mpi_distro in ['OpenMPI', 'SpectrumMPI']:
+        # OpenMPI's CC wrapper, namely mpicc, takes the --showme argument to find out
+        # the flags used for compiling and linking
+        compile_flags = check_output(['mpicc', "--showme:compile"]).decode("utf-8")
+        link_flags = check_output(['mpicc', "--showme:link"]).decode("utf-8")
+    else:
+        # TODO: This can be obtained from MPICH `mpicc -show`
+        # but does not segregate compile and link flags
         raise NotImplementedError("Unable to detect MPI compile and link flags")
-
-    # OpenMPI's CC wrapper, namely mpicc, takes the --showme argument to find out
-    # the flags used for compiling and linking
-    compile_flags = check_output(['mpicc', "--showme:compile"]).decode("utf-8")
-    link_flags = check_output(['mpicc', "--showme:link"]).decode("utf-8")
 
     return compile_flags.split(), link_flags.split()
 
@@ -386,6 +390,14 @@ class Compiler(GCCToolchain):
             # Typically we end up here
             # Make a suite of cache directories based on the soname
             cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # Has the library already been compiled?
+            try:
+                self.load(target)
+                return False, src_file
+            except OSError:
+                # The .so file isn't present, we need to compile it
+                pass
         else:
             # Warning: dropping `code` on the floor in favor to whatever is written
             # within `src_file`
@@ -882,7 +894,7 @@ class IntelCompiler(Compiler):
             check_output(["mpiicc", f"-cc={self.CC}", "--version"]).decode("utf-8")
             self.MPICC = 'mpiicc'
             self.MPICXX = 'mpicxx'
-        except FileNotFoundError:
+        except (FileNotFoundError, CalledProcessError):
             self.MPICC = 'mpicc'
             self.MPICXX = 'mpicxx'
 
@@ -900,7 +912,7 @@ class IntelKNLCompiler(IntelCompiler):
             warning("Running on Intel KNL without OpenMP is highly discouraged")
 
 
-class OneapiCompiler(IntelCompiler):
+class OneapiCompiler(Compiler):
 
     def __init_finalize__(self, **kwargs):
         IntelCompiler.__init_finalize__(self, **kwargs)
@@ -942,8 +954,6 @@ class OneapiCompiler(IntelCompiler):
 
     def __init_intel_mpi_flags__(self, **kwargs):
         pass
-
-    get_version = Compiler.get_version
 
     def __lookup_cmds__(self):
         # OneAPI HPC ToolKit comes with icpx, which is clang++,

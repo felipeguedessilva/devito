@@ -921,12 +921,19 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
             return nopadding
 
         mmts = configuration['platform'].max_mem_trans_size(self.__padding_dtype__)
-        remainder = self._size_nopad[d] % mmts
+
+        snp = self._size_nopad[d]
+        remainder = snp % mmts
         if remainder == 0:
             # Already a multiple of `mmts`, no need to pad
             return nopadding
+        else:
+            from devito.symbolics import RoundUp  # noqa
+            v = RoundUp(snp, mmts) - snp
+            if v.is_Integer:
+                v = int(v)
 
-        dpadding = (0, (mmts - remainder))
+        dpadding = (0, v)
         padding = [(0, 0)]*self.ndim
         padding[self.dimensions.index(d)] = dpadding
 
@@ -953,12 +960,12 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         """The indices of the object."""
         return DimensionTuple(*self.args, getters=self.dimensions)
 
-    @property
+    @cached_property
     def indices_ref(self):
         """The reference indices of the object (indices at first creation)."""
         return DimensionTuple(*self.function.indices, getters=self.dimensions)
 
-    @property
+    @cached_property
     def origin(self):
         """
         Origin of the AbstractFunction in term of Dimension
@@ -1074,6 +1081,11 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         io = self.interp_order
         retval = self.subs({i.subs(subs): self.indices_ref[d]
                             for d, i in mapper.items()})
+
+        if io == 0:
+            # No interpolation, just substitution (e.g nearest grid point)
+            return retval
+
         if self.is_harmonic:
             retval = retval._inv(retval, safe=self.is_harmonic_safe)
 
@@ -1129,6 +1141,17 @@ class AbstractFunction(sympy.Function, Basic, Pickable, Evaluable):
         ret = tuple(sympy.Add(i, j, k)
                     for i, j, k in zip(domain, halo, padding, strict=True))
         return DimensionTuple(*ret, getters=self.dimensions)
+
+    @cached_property
+    def symbolic_strides(self):
+        """
+        The symbolic strides of the object, expressed in number of elements.
+        """
+        strides = [sympy.Mul(*self.symbolic_shape[i+1:], evaluate=False)
+                   for i in range(self.ndim - 1)]
+        strides.append(sympy.S.One)
+
+        return DimensionTuple(*strides, getters=self.dimensions)
 
     @property
     def symbolic_size(self):
@@ -1913,6 +1936,31 @@ class Indexed(sympy.Indexed):
         except AttributeError:
             pass
         return super()._subs(old, new, **hints)
+
+    def _translate(self, mapper=None):
+        """
+        Translate the indices of the current Indexed according to the provided
+        `{Dimension -> offset}` mapper. For example, if the current Indexed is
+        `f[x+1]` and the mapper is `{x: -1}`, then the result of the translation
+        will be `f[x]`.
+
+        If `mapper` is None, then the translation will be unitary increment
+        along the fastest varying Dimension. For example, if the current
+        Indexed is `f[x+1, y+2]`, then the result of the translation will be
+        `f[x+1, y+3]` since `x` is the fastest varying Dimension.
+        """
+        mapper = mapper or {self.dimensions[-1]: 1}
+
+        if any(d not in mapper for d in self.dimensions):
+            raise ValueError(
+                f"Cannot translate {self} with mapper {mapper} since not "
+                "all dimensions are covered"
+            )
+
+        translations = [mapper.get(d, 0) for d in self.dimensions]
+        indices = [sum(i) for i in zip(self.indices, translations, strict=True)]
+
+        return self.base[indices]
 
 
 class IrregularFunctionInterface:

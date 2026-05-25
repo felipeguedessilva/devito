@@ -11,7 +11,7 @@ from devito.ir.support import (
 )
 from devito.symbolics import IntDiv, limits_mapper, uxreplace
 from devito.tools import Pickable, Tag, frozendict
-from devito.types import Eq, Inc, ReduceMax, ReduceMin, relational_min
+from devito.types import Eq, Inc, ReduceMax, ReduceMin, ReduceMinMax, relational_min
 
 __all__ = [
     'ClusterizedEq',
@@ -20,6 +20,7 @@ __all__ = [
     'OpInc',
     'OpMax',
     'OpMin',
+    'OpMinMax',
     'identity_mapper',
 ]
 
@@ -28,6 +29,10 @@ class IREq(sympy.Eq, Pickable):
 
     __rargs__ = ('lhs', 'rhs')
     __rkwargs__ = ('ispace', 'conditionals', 'implicit_dims', 'operation')
+
+    def _hashable_content(self):
+        return (*super()._hashable_content(),
+                *tuple(getattr(self, i) for i in self.__rkwargs__))
 
     @property
     def is_Scalar(self):
@@ -69,7 +74,7 @@ class IREq(sympy.Eq, Pickable):
 
     @property
     def is_Reduction(self):
-        return self.operation in (OpInc, OpMin, OpMax)
+        return self.operation in (OpInc, OpMin, OpMax, OpMinMax)
 
     @property
     def is_Increment(self):
@@ -113,7 +118,8 @@ class Operation(Tag):
         reduction_mapper = {
             Inc: OpInc,
             ReduceMax: OpMax,
-            ReduceMin: OpMin
+            ReduceMin: OpMin,
+            ReduceMinMax: OpMinMax
         }
         try:
             return reduction_mapper[type(expr)]
@@ -130,6 +136,7 @@ class Operation(Tag):
 OpInc = Operation('+')
 OpMax = Operation('max')
 OpMin = Operation('min')
+OpMinMax = Operation('minmax')
 
 
 identity_mapper = {
@@ -299,7 +306,7 @@ class ClusterizedEq(IREq):
                     setattr(expr, f'_{i}', v)
             else:
                 expr._ispace = kwargs['ispace']
-                expr._conditionals = kwargs.get('conditionals', frozendict())
+                expr._conditionals = kwargs.get('conditionals', {})
                 expr._implicit_dims = input_expr.implicit_dims
                 expr._operation = Operation.detect(input_expr)
         elif len(args) == 2:
@@ -310,6 +317,10 @@ class ClusterizedEq(IREq):
         else:
             raise ValueError(f"Cannot construct ClusterizedEq from args={str(args)} "
                              f"and kwargs={str(kwargs)}")
+
+        # Immutability (and thus hashability, etc)
+        expr._conditionals = frozendict(expr._conditionals)
+
         return expr
 
     func = IREq._rebuild

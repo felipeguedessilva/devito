@@ -17,6 +17,7 @@ from devito.ir.equations.algorithms import concretize_subdims
 from devito.ir.iet import (
     Conditional, Expression, FindNodes, FindSymbols, Iteration, retrieve_iteration_tree
 )
+from devito.ir.support.space import Backward, Forward
 from devito.symbolics import INT, IntDiv, indexify, retrieve_functions
 from devito.types import Array, StencilDimension, Symbol
 from devito.types.basic import Scalar
@@ -234,6 +235,26 @@ class TestBufferedDimension:
         op.apply(time_M=9)
 
         assert np.all(u.data == 10)
+
+    @pytest.mark.parametrize('direction', ['fwd', 'bwd'])
+    def test_buffer1_direction(self, direction):
+        grid = Grid(shape=(10, 10))
+
+        u = TimeFunction(name='u', grid=grid, save=Buffer(1))
+
+        # Equations technically have no implied time direction as u.forward and u refer
+        # to the same buffer slot. However, user usage of u.forward and u.backward should
+        # be picked up by the compiler
+        if direction == 'fwd':
+            op = Operator(Eq(u.forward, u + 1))
+        else:
+            op = Operator(Eq(u.backward, u + 1))
+
+        # Check for time loop direction
+        trees = retrieve_iteration_tree(op)
+        direction = Forward if direction == 'fwd' else Backward
+        for tree in trees:
+            assert tree[0].direction == direction
 
 
 class TestSubDimension:
@@ -1253,10 +1274,10 @@ class TestConditionalDimension:
 
         radius = 1
         indices = [(INT(floor(i)), INT(floor(i))+radius)
-                   for i in sf._position_map]
+                   for i in sf._position_map()]
         bounds = [i.symbolic_size - radius for i in grid.dimensions]
 
-        eqs = [Eq(p, v) for (v, p) in sf._position_map.items()]
+        eqs = [Eq(p, v) for (v, p) in sf._position_map().items()]
         for e, i in enumerate(product(*indices)):
             args = [j > 0 for j in i]
             args.extend([j < k for j, k in zip(i, bounds, strict=True)])

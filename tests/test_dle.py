@@ -8,9 +8,11 @@ import sympy
 from conftest import _R, assert_blocking, assert_structure, skipif
 from devito import (
     CustomDimension, DefaultDimension, Dimension, Eq, Function, Grid, Inc, Operator,
-    PrecomputedSparseTimeFunction, ReduceMax, ReduceMin, SpaceDimension,
-    SparseTimeFunction, SubDimension, TimeFunction, configuration, cos, dimensions, info
+    PrecomputedSparseTimeFunction, ReduceMax, ReduceMin, ReduceMinMax, SpaceDimension,
+    SparseTimeFunction, SubDimension, TimeFunction, configuration, cos, dimensions, info,
+    switchconfig
 )
+from devito.arch.compiler import IntelCompiler
 from devito.exceptions import InvalidArgument
 from devito.ir.iet import (
     Expression, FindNodes, IsPerfectIteration, Iteration, retrieve_iteration_tree
@@ -314,8 +316,8 @@ class TestBlockingOptRelax:
                                               'openmp': True,
                                               'par-collapse-ncores': 1}))
 
-        assert_structure(op, ['t', 't,p_s0_blk0,p_s,rsx,rsy'],
-                         't,p_s0_blk0,p_s,rsx,rsy')
+        assert_structure(op, ['t', 't,p_s0_blk0,p_s,rp_sx,rp_sy'],
+                         't,p_s0_blk0,p_s,rp_sx,rp_sy')
 
 
 class TestBlockingParTile:
@@ -755,7 +757,7 @@ class TestNodeParallelism:
         ('[Eq(f, 2*f)]', [2, 0, 0], False),
         ('[Eq(u, 2*u)]', [0, 2, 0, 0], False),
         ('[Eq(u, 2*u + f)]', [0, 3, 0, 0, 0, 0, 0], True),
-        ('[Eq(u, 2*u), Eq(f, u.dzr)]', [0, 2, 0, 0, 0], False)
+        ('[Eq(u, 2*u), Eq(f, u.dzr)]', [0, 2, 0, 0, 2, 0, 0], False)
     ])
     def test_collapsing(self, eqns, expected, blocking):
         grid = Grid(shape=(3, 3, 3))
@@ -998,6 +1000,31 @@ class TestNodeParallelism:
         op()
         assert n.data[0] == 26
         assert n.data[1] == 0
+
+    def test_array_minmax_reduction_simultaneous(self):
+        """
+        Test the combined min/max reduction DSL construct.
+        """
+        grid = Grid(shape=(3, 3, 3))
+        i = Dimension(name='i')
+
+        f = Function(name='f', grid=grid)
+        n = Function(name='n', grid=grid, shape=(2,), dimensions=(i,))
+
+        f.data[:] = np.arange(-5, 22).reshape((3, 3, 3))
+
+        eqn = [ReduceMinMax(n[0], f)]
+
+        op = Operator(eqn)
+
+        if 'openmp' in configuration['language']:
+            iterations = FindNodes(Iteration).visit(op)
+            expected = "reduction(min:rmin0) reduction(max:rmax0)"
+            assert expected in iterations[0].pragmas[0].ccode.value
+
+        op()
+        assert n.data[0] == -5
+        assert n.data[1] == 21
 
     def test_incs_no_atomic(self):
         """
@@ -1272,6 +1299,7 @@ class TestNestedParallelism:
             ('omp parallel for collapse(2) schedule(dynamic,1) '
              'num_threads(nthreads_nested)')
 
+    @switchconfig(compiler='icc')
     def test_multiple_subnests_v0(self):
         grid = Grid(shape=(3, 3, 3))
         x, y, z = grid.dimensions
@@ -1304,6 +1332,7 @@ class TestNestedParallelism:
             ('omp parallel for collapse(2) schedule(dynamic,1) '
              'num_threads(nthreads_nested)')
 
+    @switchconfig(compiler='icc')
     def test_multiple_subnests_v1(self):
         """
         Unlike ``test_multiple_subnestes_v0``, now we use the ``cire-rotate=True``
@@ -1436,3 +1465,42 @@ class TestNestedParallelism:
 
         assert iterations[1].pragmas[0].ccode.value ==\
             "".join([ompfor_string, scheduling_string])
+
+    def test_nested_parallelism_support(self):
+        grid = Grid(shape=(10, 10, 10))
+
+        f = Function(name='f', grid=grid, space_order=4)
+        v = TimeFunction(name="v", grid=grid, space_order=4)
+        v1 = TimeFunction(name="v1", grid=grid, space_order=4)
+
+        f.data_with_halo[:] = 0.5
+        v.data_with_halo[:] = 1.
+        v1.data_with_halo[:] = 1.
+
+        eqn = Eq(v.forward, (v.dx * (1 + 2*f) * f).dx)
+        op = Operator(eqn, opt=('advanced', {'openmp': True,
+                                             'par-collapse-ncores': 1,
+                                             'par-nested': 0}))
+
+        bns, _ = assert_blocking(op, {'x0_blk0'})
+        trees = retrieve_iteration_tree(bns['x0_blk0'])
+        assert len(trees) == 2
+
+        # Check omp pargams
+        assert trees[0][0].pragmas[0].ccode.value == \
+            'omp for collapse(2) schedule(dynamic,1)'
+        if isinstance(configuration['compiler'], IntelCompiler):
+            # Supports nested parallelism
+            assert trees[0][2].pragmas[0].ccode.value == \
+                'omp parallel for collapse(2) schedule(dynamic,1)'\
+                ' num_threads(nthreads_nested)'
+            assert trees[1][2].pragmas[0].ccode.value == \
+                'omp parallel for collapse(2) schedule(static,1)'\
+                ' num_threads(nthreads_nested)'
+        else:
+            # Most compiler don't support nested parallelism
+            assert not trees[0][2].pragmas
+            assert not trees[1][2].pragmas
+
+        # Should compile properly
+        op.cfunction  # noqa: B018

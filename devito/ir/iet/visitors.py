@@ -1377,7 +1377,7 @@ class Uxreplace(Transformer):
     def visit_Expression(self, o):
         return o._rebuild(expr=uxreplace(o.expr, self.mapper))
 
-    def visit_Iteration(self, o):
+    def _visit_Iteration_common(self, o):
         nodes = self._visit(o.nodes)
         dimension = uxreplace(o.dim, self.mapper)
         limits = [uxreplace(i, self.mapper) for i in o.limits]
@@ -1386,8 +1386,24 @@ class Uxreplace(Transformer):
         uindices = [uxreplace(i, self.mapper) for i in o.uindices]
         uindices = filter_ordered(i for i in uindices if isinstance(i, Dimension))
 
+        return nodes, dimension, limits, pragmas, uindices
+
+    def visit_Iteration(self, o):
+        nodes, dimension, limits, pragmas, uindices = \
+            self._visit_Iteration_common(o)
+
         return o._rebuild(nodes=nodes, dimension=dimension, limits=limits,
                           pragmas=pragmas, uindices=uindices)
+
+    def visit_PragmaIteration(self, o):
+        nodes, dimension, limits, pragmas, uindices = \
+            self._visit_Iteration_common(o)
+
+        reduction = [(uxreplace(var, self.mapper), imask, op)
+                     for var, imask, op in (o.reduction or [])]
+
+        return o._rebuild(nodes=nodes, dimension=dimension, limits=limits,
+                          pragmas=pragmas, uindices=uindices, reduction=reduction)
 
     def visit_Definition(self, o):
         try:
@@ -1478,7 +1494,7 @@ class Uxreplace(Transformer):
     def visit_HaloSpot(self, o):
         hs = o.halo_scheme
         fmapper = {self.mapper.get(k, k): v for k, v in hs.fmapper.items()}
-        halo_scheme = hs.build(fmapper, hs.honored)
+        halo_scheme = hs._rebuild(fmapper=fmapper)
         body = self._visit(o.body)
         return o._rebuild(halo_scheme=halo_scheme, body=body)
 

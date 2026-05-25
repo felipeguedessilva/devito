@@ -2,6 +2,7 @@
 Utilities to turn SymPy objects into C strings.
 """
 from contextlib import suppress
+from ctypes import _Pointer
 
 import numpy as np
 import sympy
@@ -110,11 +111,17 @@ class BasePrinter(CodePrinter):
         return super().parenthesize(item, level, strict=strict)
 
     def _print_PyCPointerType(self, expr):
-        ctype = f'{self._print_type(expr._type_)}'
+        base_type, nstart = expr, 0
+        while issubclass(base_type, _Pointer):
+            base_type = base_type._type_
+            nstart += 1
+
+        ctype = f'{self._print_type(base_type)}'
+        stars = '*' * nstart
         if ctype.endswith('*'):
-            return f'{ctype}*'
+            return f'{ctype}{stars}'
         else:
-            return f'{ctype} *'
+            return f'{ctype} {stars}'
 
     def _print_type(self, expr):
         with suppress(TypeError):
@@ -219,6 +226,11 @@ class BasePrinter(CodePrinter):
         base = self._print(expr.base)
         val = self._print(expr.val)
         return f'SAFEINV({val}, {base})'
+
+    def _print_RoundUp(self, expr):
+        value = self._print(expr.value)
+        step = self._print(expr.step)
+        return f'ROUND_UP({value}, {step})'
 
     def _print_Mod(self, expr):
         """Print a Mod as a C-like %-based operation."""
