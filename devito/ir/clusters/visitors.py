@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from itertools import groupby
 
 from devito.ir.support import IterationSpace, null_ispace
-from devito.tools import flatten, timed_pass
+from devito.tools import cached_hash, flatten, timed_pass
 
 __all__ = ['Queue', 'cluster_pass']
 
@@ -37,15 +37,7 @@ class Queue:
         assert self._q_ispace_in_key
         ispace = cluster.ispace[:level]
 
-        if self._q_guards_in_key:
-            try:
-                guards = tuple(cluster.guards.get(i.dim) for i in ispace)
-            except AttributeError:
-                # `cluster` is actually a ClusterGroup
-                assert len(cluster.guards) == 1
-                guards = tuple(cluster.guards[0].get(i.dim) for i in ispace)
-        else:
-            guards = None
+        guards = self._make_key_guards(cluster, ispace)
 
         if self._q_properties_in_key:
             properties = cluster.properties.drop(cluster.ispace[level:].itdims)
@@ -67,6 +59,17 @@ class Queue:
         subkey = self._make_key_hook(cluster, level)
 
         return (prefix,) + subkey
+
+    def _make_key_guards(self, cluster, ispace):
+        if not self._q_guards_in_key:
+            return None
+
+        try:
+            return tuple(cluster.guards.get(i.dim) for i in ispace)
+        except AttributeError:
+            # `cluster` is actually a ClusterGroup
+            assert len(cluster.guards) == 1
+            return tuple(cluster.guards[0].get(i.dim) for i in ispace)
 
     def _make_key_hook(self, cluster, level):
         return ()
@@ -113,6 +116,10 @@ class Queue:
 
 class Prefix(IterationSpace):
 
+    @classmethod
+    def _preprocess_args(cls, ispace, guards, properties, syncs):
+        return (ispace, guards, properties, syncs), {}
+
     def __init__(self, ispace, guards, properties, syncs):
         super().__init__(ispace.intervals, ispace.sub_iterators, ispace.directions)
 
@@ -127,6 +134,7 @@ class Prefix(IterationSpace):
                 self.properties == other.properties and
                 self.syncs == other.syncs)
 
+    @cached_hash
     def __hash__(self):
         return hash((self.intervals, self.sub_iterators, self.directions,
                      self.guards, self.properties, self.syncs))

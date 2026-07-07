@@ -47,7 +47,7 @@ jobs:
 
     steps:
     - name: Checkout devito
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Set up Python
       uses: actions/setup-python@v6
@@ -71,7 +71,7 @@ jobs:
         ipcluster start --profile=mpi --engines=mpi -n 4 --daemonize
         # A few seconds to ensure workers are ready
         sleep 10
-        pytest -v --nbval examples/mpi
+        pytest -vvv --nbval examples/mpi
         ipcluster stop --profile=mpi
 
     - name: Test seismic examples

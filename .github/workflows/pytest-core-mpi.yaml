@@ -36,7 +36,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Checkout devito
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Install dependencies
       run: |
@@ -65,7 +65,7 @@ jobs:
             examples/seismic/tti
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v6
+      uses: codecov/codecov-action@v7
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         name: pytest-mpi
@@ -95,7 +95,7 @@ jobs:
 
     steps:
     - name: Checkout devito
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - id: build
       name: Build docker image

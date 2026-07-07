@@ -39,10 +39,11 @@ VECTORIZED = Property('vector-dim')
 TILABLE = Property('tilable')
 """A fully parallel Dimension that would benefit from tiling (or "blocking")."""
 
-TILABLE_SMALL = Property('tilable*')
+NO_TUNING = Property('notuning')
 """
-Like TILABLE, but it would benefit from relatively small block, since the
-iteration space is likely to be very small.
+A Dimension that would be unlikely to benefit from tuning. For example, the
+underlying iteration space is relatively small, and/or the enclosed expressions
+are not characterized by data reuse, etc.
 """
 
 SKEWABLE = Property('skewable')
@@ -115,7 +116,6 @@ A Dimension along which the shared-memory right-HALO data region is initialized.
 
 # Bundles
 PARALLELS = {PARALLEL, PARALLEL_INDEP, PARALLEL_IF_ATOMIC, PARALLEL_IF_PVT}
-TILABLES = {TILABLE, TILABLE_SMALL}
 
 
 def normalize_properties(*args):
@@ -199,19 +199,27 @@ class Properties(frozendict):
     A mapper {Dimension -> {properties}}.
     """
 
+    def __init__(self, *args, **kwargs):
+        mapper = dict(*args, **kwargs)
+        mapper = {d: frozenset(as_tuple(v)) for d, v in mapper.items()}
+        super().__init__(mapper)
+
     @property
     def dimensions(self):
         return tuple(self)
+
+    def _reuse_if_untouched(self, mapper):
+        return self if mapper == self else Properties(mapper)
 
     def add(self, dims, properties=None):
         m = dict(self)
         for d in as_tuple(dims):
             m[d] = set(self.get(d, [])) | set(as_tuple(properties))
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
     def filter(self, key):
         m = {d: v for d, v in self.items() if key(d)}
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
     def drop(self, dims=None, properties=None):
         if dims is None:
@@ -222,7 +230,7 @@ class Properties(frozendict):
                 m.pop(d, None)
             else:
                 m[d] = self[d] - set(as_tuple(properties))
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
     def parallelize(self, dims):
         m = dict(self)
@@ -231,13 +239,13 @@ class Properties(frozendict):
             v.difference_update({PARALLEL_IF_PVT, PARALLEL_IF_ATOMIC, SEQUENTIAL})
             v.add(PARALLEL)
             m[d] = v
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
     def affine(self, dims):
         m = dict(self)
         for d in as_tuple(dims):
             m[d] = set(self.get(d, [])) | {AFFINE}
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
     def sequentialize(self, dims=None):
         if dims is None:
@@ -245,25 +253,19 @@ class Properties(frozendict):
         m = dict(self)
         for d in as_tuple(dims):
             m[d] = normalize_properties(set(self.get(d, [])), {SEQUENTIAL})
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
     def prefetchable(self, dims, v=PREFETCHABLE):
         m = dict(self)
         for d in as_tuple(dims):
             m[d] = self.get(d, set()) | {v}
-        return Properties(m)
+        return self._reuse_if_untouched(m)
 
-    def block(self, dims, kind='default'):
-        if kind == 'default':
-            p = TILABLE
-        elif kind == 'small':
-            p = TILABLE_SMALL
-        else:
-            raise ValueError
+    def block(self, dims):
         m = dict(self)
         for d in as_tuple(dims):
-            m[d] = set(self.get(d, [])) | {p}
-        return Properties(m)
+            m[d] = set(self.get(d, [])) | {TILABLE}
+        return self._reuse_if_untouched(m)
 
     def inbound(self, dims):
         return self.add(dims, INBOUND)
@@ -289,6 +291,9 @@ class Properties(frozendict):
                                                  INIT_HALO_LEFT_SHM})
         return properties
 
+    def notune(self, dims):
+        return self.add(dims, NO_TUNING)
+
     def is_parallel(self, dims):
         return any(len(self[d] & {PARALLEL, PARALLEL_INDEP}) > 0
                    for d in as_tuple(dims))
@@ -306,19 +311,16 @@ class Properties(frozendict):
         return any({INBOUND, INBOUND_IF_RELAXED}.intersection(self.get(d, set()))
                    for d in as_tuple(dims))
 
-    def is_sequential(self, dims):
-        return any(SEQUENTIAL in self.get(d, ()) for d in as_tuple(dims))
-
     def is_blockable(self, d):
-        return bool(self.get(d, set()) & {TILABLE, TILABLE_SMALL})
-
-    def is_blockable_small(self, d):
-        return TILABLE_SMALL in self.get(d, set())
+        return bool(TILABLE in self.get(d, ()))
 
     def _is_property_any(self, dims, v):
         if dims is None:
             dims = list(self)
         return any(v in self.get(d, set()) for d in as_tuple(dims))
+
+    def is_sequential(self, dims=None):
+        return self._is_property_any(dims, SEQUENTIAL)
 
     def is_prefetchable(self, dims=None, v=PREFETCHABLE):
         return self._is_property_any(dims, PREFETCHABLE)
@@ -334,6 +336,25 @@ class Properties(frozendict):
 
     def is_halo_init(self, dims=None):
         return self.is_halo_left_init(dims) or self.is_halo_right_init(dims)
+
+    def avoid_tuning(self, dims):
+        return any(NO_TUNING in self.get(d, set()) for d in as_tuple(dims))
+
+    def subs(self, mapper):
+        return Properties({mapper.get(d, d): v for d, v in self.items()})
+
+    def promote(self, subs):
+        m = self
+        for d, pd in subs.items():
+            if pd not in d._defines:
+                raise ValueError(f"Cannot promote {d} to {pd} as {pd} does not "
+                                 f"belong to {d}'s hierarchy")
+
+            v = normalize_properties(*[self.get(i, set()) for i in d._defines])
+
+            m = self.drop(d._defines).add(pd, v)
+
+        return m
 
     @property
     def nblockable(self):

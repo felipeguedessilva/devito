@@ -79,9 +79,18 @@ class TestDeviceID:
     CUDA_VISIBLE_DEVICES are correctly handled.
     """
 
+    visible_device_envs = (
+        'CUDA_VISIBLE_DEVICES',
+        'NVIDIA_VISIBLE_DEVICES',
+        'ROCR_VISIBLE_DEVICES',
+        'HIP_VISIBLE_DEVICES'
+    )
+
     @pytest.mark.parametrize('env_variables', [{"CUDA_VISIBLE_DEVICES": "1"},
                                                {"CUDA_VISIBLE_DEVICES": "1,2"},
                                                {"CUDA_VISIBLE_DEVICES": "1,0"},
+                                               {"NVIDIA_VISIBLE_DEVICES": "1"},
+                                               {"NVIDIA_VISIBLE_DEVICES": "1,2"},
                                                {"ROCR_VISIBLE_DEVICES": "1"},
                                                {"HIP_VISIBLE_DEVICES": " 1"}])
     def test_visible_devices(self, env_variables):
@@ -94,18 +103,31 @@ class TestDeviceID:
 
         eq = Eq(u, u+1)
 
-        with switchenv(env_variables):
+        temp_env = dict(env_variables)
+        other = set(self.visible_device_envs) - set(temp_env)
+        temp_env.update({i: None for i in other})
+
+        with switchenv(temp_env):
             op1 = Operator(eq)
             argmap1 = op1.arguments()
             # All variants in parameterisation should yield deviceid 1
             assert argmap1._physical_deviceid == 1
 
-        # Check that physical deviceid is 0 when no environment variables set
-        op2 = Operator(eq)
+    def test_default_physical_deviceid(self):
+        """
+        Test that the default physical device ID is 0 when no visible-device
+        environment variable is set.
+        """
+        grid = Grid(shape=(10, 10))
+        u = Function(name='u', grid=grid)
 
-        argmap2 = op2.arguments()
-        # Default physical deviceid expected to be 0
-        assert argmap2._physical_deviceid == 0
+        eq = Eq(u, u+1)
+
+        with switchenv({i: None for i in self.visible_device_envs}):
+            op2 = Operator(eq)
+
+            argmap2 = op2.arguments()
+            assert argmap2._physical_deviceid == 0
 
     @pytest.mark.parallel(mode=2)
     @pytest.mark.parametrize('visible_devices', [
@@ -142,9 +164,10 @@ class TestDeviceID:
             assert argmap1._physical_deviceid == expected
 
         # In default case, physical deviceid will equal rank
-        op2 = Operator(eq)
-        argmap2 = op2.arguments()
-        assert argmap2._physical_deviceid == rank
+        with switchenv({i: None for i in self.visible_device_envs}):
+            op2 = Operator(eq)
+            argmap2 = op2.arguments()
+            assert argmap2._physical_deviceid == rank
 
     def test_visible_devices_with_devito_deviceid(self):
         """Test interaction between CUDA_VISIBLE_DEVICES and DEVITO_DEVICEID"""
@@ -184,8 +207,9 @@ class TestDeviceID:
 
         op = Operator(Eq(u, u+1))
 
-        argmap = op.arguments(deviceid=deviceid)
-        assert argmap._physical_deviceid == deviceid
+        with switchenv({i: None for i in self.visible_device_envs}):
+            argmap = op.arguments(deviceid=deviceid)
+            assert argmap._physical_deviceid == deviceid
 
 
 class TestCodeGeneration:

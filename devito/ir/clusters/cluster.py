@@ -8,13 +8,15 @@ from devito.ir.equations import ClusterizedEq
 from devito.ir.support import (
     PARALLEL, PARALLEL_IF_PVT, BaseGuardBoundNext, DataSpace, Forward, Guards, Interval,
     IntervalGroup, IterationSpace, PrefetchUpdate, Properties, Scope, WaitLock, WithLock,
-    detect_accesses, detect_io, maximum, minimum, normalize_properties, normalize_syncs,
-    null_ispace, tailor_properties, update_properties
+    detect_accesses, maximum, minimum, normalize_properties, normalize_syncs, null_ispace,
+    tailor_properties, update_properties
 )
 from devito.mpi.halo_scheme import HaloScheme, HaloTouch
 from devito.mpi.reduction_scheme import DistReduce
-from devito.symbolics import estimate_cost
-from devito.tools import as_tuple, filter_ordered, flatten, infer_dtype
+from devito.symbolics import estimate_cost, uxreplace
+from devito.tools import (
+    CacheInstances, as_tuple, cached_hash, filter_ordered, flatten, infer_dtype
+)
 from devito.types import (
     CriticalRegion, Fence, Indexed, PhaseMarker, TensorMove, ThreadArrive, ThreadCommit,
     ThreadPoolSync, ThreadWait, WeakFence
@@ -23,110 +25,45 @@ from devito.types import (
 __all__ = ["Cluster", "ClusterGroup"]
 
 
-class Cluster:
+class EqBlock(CacheInstances):
 
     """
-    A Cluster is an ordered sequence of expressions in an IterationSpace.
-
-    Parameters
-    ----------
-    exprs : expr-like or list of expr-like
-        An ordered sequence of expressions computing a tensor.
-    ispace : IterationSpace, optional
-        The Cluster iteration space.
-    guards : dict, optional
-        Mapper from Dimensions to expr-like, representing the conditions under
-        which the Cluster should be computed.
-    properties : dict, optional
-        Mapper from Dimensions to Property, describing the Cluster properties
-        such as its parallel Dimensions.
-    syncs : dict, optional
-        Mapper from Dimensions to lists of SyncOps, that is ordered sequences of
-        synchronization operations that must be performed in order to compute the
-        Cluster asynchronously.
-    halo_scheme : HaloScheme, optional
-        The halo exchanges required by the Cluster.
+    A sequence of equations with associated metadata.
     """
+
+    @classmethod
+    def _preprocess_args(cls, exprs, ispace=null_ispace, guards=None,
+                         properties=None, syncs=None, halo_scheme=None):
+        exprs = tuple(ClusterizedEq(e, ispace=ispace) for e in as_tuple(exprs))
+        guards = Guards(guards or {})
+        properties = Properties(properties or {})
+        syncs = normalize_syncs(syncs or {})
+
+        return (exprs, ispace, guards, properties, syncs, halo_scheme), {}
 
     def __init__(self, exprs, ispace=null_ispace, guards=None, properties=None,
                  syncs=None, halo_scheme=None):
-        self._exprs = tuple(ClusterizedEq(e, ispace=ispace) for e in as_tuple(exprs))
+        self._exprs = exprs
         self._ispace = ispace
-        self._guards = Guards(guards or {})
-        self._syncs = normalize_syncs(syncs or {})
-
-        properties = Properties(properties or {})
-        properties = tailor_properties(properties, ispace)
-        self._properties = update_properties(properties, self.exprs)
-
+        self._guards = guards
+        self._syncs = syncs
         self._halo_scheme = halo_scheme
 
-    def __repr__(self):
-        return "Cluster([{}])".format(('\n' + ' '*9).join(f'{i}' for i in self.exprs))
+        properties = tailor_properties(properties, ispace)
+        self._properties = update_properties(properties, self._exprs)
 
-    @classmethod
-    def from_clusters(cls, *clusters):
-        """
-        Build a new Cluster from a sequence of pre-existing Clusters with
-        compatible IterationSpace.
-        """
-        assert len(clusters) > 0
-        root = clusters[0]
+    def __eq__(self, other):
+        return (type(self) is type(other) and
+                self.exprs == other.exprs and
+                self.ispace == other.ispace and
+                self.guards == other.guards and
+                self.properties == other.properties and
+                self.syncs == other.syncs and
+                self.halo_scheme == other.halo_scheme)
 
-        if len(clusters) == 1:
-            return root
-
-        if not all(root.ispace.is_compatible(c.ispace) for c in clusters):
-            raise ValueError("Cannot build a Cluster from Clusters with "
-                             "incompatible IterationSpace")
-        if not all(root.guards == c.guards for c in clusters):
-            raise ValueError("Cannot build a Cluster from Clusters with "
-                             "non-homogeneous guards")
-
-        writes = set().union(*[c.scope.writes for c in clusters])
-        reads = set().union(*[c.scope.reads for c in clusters])
-        if any(f._mem_shared for f in writes & reads):
-            raise ValueError("Cannot build a Cluster from Clusters with "
-                             "read-write conflicts on shared-memory Functions")
-
-        exprs = chain(*[c.exprs for c in clusters])
-        ispace = IterationSpace.union(*[c.ispace for c in clusters])
-
-        guards = root.guards
-
-        properties = reduce_properties(clusters)
-
-        try:
-            syncs = normalize_syncs(*[c.syncs for c in clusters])
-        except ValueError as e:
-            raise ValueError(
-                "Cannot build a Cluster from Clusters with "
-                "non-compatible synchronization operations"
-            ) from e
-
-        halo_scheme = HaloScheme.union([c.halo_scheme for c in clusters])
-
-        return Cluster(exprs, ispace, guards, properties, syncs, halo_scheme)
-
-    def rebuild(self, *args, **kwargs):
-        """
-        Build a new Cluster from the attributes given as keywords. All other
-        attributes are taken from ``self``.
-        """
-        # Shortcut for backwards compatibility
-        if args:
-            if len(args) != 1:
-                raise ValueError("rebuild takes at most one positional argument (exprs)")
-            if kwargs.get('exprs'):
-                raise ValueError("`exprs` provided both as arg and kwarg")
-            kwargs['exprs'] = args[0]
-
-        return self.__class__(exprs=kwargs.get('exprs', self.exprs),
-                              ispace=kwargs.get('ispace', self.ispace),
-                              guards=kwargs.get('guards', self.guards),
-                              properties=kwargs.get('properties', self.properties),
-                              syncs=kwargs.get('syncs', self.syncs),
-                              halo_scheme=kwargs.get('halo_scheme', self.halo_scheme))
+    def __hash__(self):
+        return hash((self.exprs, self.ispace, self.guards, self.properties,
+                     self.syncs, self.halo_scheme))
 
     @property
     def exprs(self):
@@ -175,7 +112,7 @@ class Cluster:
     @cached_property
     def exprs_dimensions(self):
         """
-        The Dimensions that appear explicitly in the Cluster expressions.
+        The Dimensions that appear explicitly in the expressions.
         """
         dims_explicit = {i for i in self.free_symbols if i.is_Dimension}
         dims_implicit = {d for e in self.exprs for d in e.implicit_dims}
@@ -184,7 +121,7 @@ class Cluster:
     @cached_property
     def guards_dimensions(self):
         """
-        The Dimensions that appear explicitly in the Cluster guards.
+        The Dimensions that appear explicitly in the guards.
         """
         syms_guards = {d for e in self.guards.values() for d in e.free_symbols}
         dims_guards = {i for i in syms_guards if i.is_Dimension}
@@ -205,7 +142,7 @@ class Cluster:
     @cached_property
     def dist_dimensions(self):
         """
-        The Cluster's distributed Dimensions.
+        The distributed Dimensions.
         """
         ret = set()
         for f in self.functions:
@@ -231,7 +168,7 @@ class Cluster:
         elif len(grids) == 1:
             return grids.pop()
         else:
-            raise ValueError("Cluster has no unique Grid")
+            raise ValueError("Multiple Grids detected")
 
     @cached_property
     def is_scalar(self):
@@ -359,7 +296,7 @@ class Cluster:
     @cached_property
     def is_async(self):
         """
-        True if an asynchronous Cluster, False otherwise.
+        True if asynchronous, False otherwise.
         """
         return any(isinstance(s, (WithLock, PrefetchUpdate))
                    for s in flatten(self.syncs.values()))
@@ -367,8 +304,8 @@ class Cluster:
     @cached_property
     def is_wait(self):
         """
-        True if a Cluster waiting on a lock (that is a special synchronization
-        operation), False otherwise.
+        True if waiting on a lock (that is a special synchronization operation),
+        False otherwise.
         """
         return any(isinstance(s, WaitLock)
                    for s in flatten(self.syncs.values()))
@@ -376,14 +313,10 @@ class Cluster:
     @cached_property
     def dtype(self):
         """
-        The arithmetic data type of the Cluster.
+        The arithmetic data type of the enclosed expressions.
 
-        If the Cluster performs floating point arithmetic, then the expressions
-        performing integer arithmetic are ignored, assuming that they are only
-        carrying out array index calculations.
-
-        If two expressions perform calculations with different precision, the
-        data type with highest precision is returned.
+        If two expressions perform calculations with different precision, the data
+        type with highest precision is returned.
         """
         dtypes = set()
         for i in self.exprs:
@@ -399,7 +332,7 @@ class Cluster:
     @cached_property
     def dspace(self):
         """
-        Derive the DataSpace of the Cluster from its expressions, IterationSpace,
+        The DataSpace deriving from the enclosed expressions, IterationSpace,
         and Guards.
         """
         accesses = detect_accesses(self.exprs)
@@ -484,14 +417,15 @@ class Cluster:
     @cached_property
     def traffic(self):
         """
-        The Cluster compulsory traffic (number of reads/writes), as a mapper
-        from Functions to IntervalGroups.
+        The compulsory traffic (number of reads/writes), as a mapper from
+        Functions to IntervalGroups.
 
         Notes
         -----
         If a Function is both read and written, then it is counted twice.
         """
-        reads, writes = detect_io(self.exprs, relax=True)
+        reads = flatten(i.read_functions_relaxed for i in self.exprs)
+        writes = flatten(i.write_functions_relaxed for i in self.exprs)
         accesses = [(i, 'r') for i in reads] + [(i, 'w') for i in writes]
 
         # Ordering isn't important at this point, so returning an unordered
@@ -525,6 +459,159 @@ class Cluster:
         return ret
 
 
+class Cluster:
+
+    """
+    A context-sensitive sequence of equations.
+
+    The structural payload (equations, IterationSpace, ...) lives in the
+    underlying EqBlock. A Cluster, unlike EqBlock, deliberately keeps identity
+    semantics because its position in a sequence of Clusters does matter.  It
+    follows that two Cluster instances may share the same EqBlock, but they
+    remain distinct: Clusters intentionally use object identity for equality
+    and hashing, so only references to the same Cluster object compare equal.
+
+    Parameters
+    ----------
+    exprs : expr-like or list of expr-like
+        An ordered sequence of expressions computing a tensor.
+    ispace : IterationSpace, optional
+        The Cluster iteration space.
+    guards : dict, optional
+        Mapper from Dimensions to expr-like, representing the conditions under
+        which the Cluster should be computed.
+    properties : dict, optional
+        Mapper from Dimensions to Property, describing the Cluster properties
+        such as its parallel Dimensions.
+    syncs : dict, optional
+        Mapper from Dimensions to lists of SyncOps, that is ordered sequences of
+        synchronization operations that must be performed in order to compute the
+        Cluster asynchronously.
+    halo_scheme : HaloScheme, optional
+        The halo exchanges required by the Cluster.
+    """
+
+    def __init__(self, exprs, ispace=null_ispace, guards=None, properties=None,
+                 syncs=None, halo_scheme=None):
+        self._block = EqBlock(exprs, ispace, guards, properties, syncs, halo_scheme)
+
+    def __repr__(self):
+        return "Cluster([{}])".format(('\n' + ' '*9).join(f'{i}' for i in self.exprs))
+
+    def __getattr__(self, name):
+        try:
+            block = object.__getattribute__(self, '_block')
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(block, name)
+
+    @classmethod
+    def from_clusters(cls, *clusters):
+        """
+        Build a new Cluster from a sequence of pre-existing Clusters with
+        compatible IterationSpace.
+        """
+        assert len(clusters) > 0
+        root = clusters[0]
+
+        if len(clusters) == 1:
+            return root
+
+        if not all(root.ispace.is_compatible(c.ispace) for c in clusters):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "incompatible IterationSpace")
+        if not all(root.guards == c.guards for c in clusters):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "non-homogeneous guards")
+
+        writes = set().union(*[c.scope.writes for c in clusters])
+        reads = set().union(*[c.scope.reads for c in clusters])
+        if any(f._mem_shared for f in writes & reads):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "read-write conflicts on shared-memory Functions")
+
+        exprs = chain(*[c.exprs for c in clusters])
+        ispace = IterationSpace.union(*[c.ispace for c in clusters])
+
+        guards = root.guards
+
+        properties = reduce_properties(clusters)
+
+        try:
+            syncs = normalize_syncs(*[c.syncs for c in clusters])
+        except ValueError as e:
+            raise ValueError(
+                "Cannot build a Cluster from Clusters with "
+                "non-compatible synchronization operations"
+            ) from e
+
+        halo_scheme = HaloScheme.union([c.halo_scheme for c in clusters])
+
+        return Cluster(exprs, ispace, guards, properties, syncs, halo_scheme)
+
+    def rebuild(self, *args, **kwargs):
+        """
+        Build a new Cluster from the attributes given as keywords. All other
+        attributes are taken from ``self``.
+        """
+        # Shortcut for backwards compatibility
+        if args:
+            if len(args) != 1:
+                raise ValueError("rebuild takes at most one positional argument (exprs)")
+            if kwargs.get('exprs'):
+                raise ValueError("`exprs` provided both as arg and kwarg")
+            kwargs['exprs'] = args[0]
+
+        exprs = kwargs.get('exprs', self.exprs)
+        ispace = kwargs.get('ispace', self.ispace)
+        guards = kwargs.get('guards', self.guards)
+        properties = kwargs.get('properties', self.properties)
+        syncs = kwargs.get('syncs', self.syncs)
+        halo_scheme = kwargs.get('halo_scheme', self.halo_scheme)
+
+        if exprs is self.exprs and \
+           ispace is self.ispace and \
+           guards is self.guards and \
+           properties is self.properties and \
+           syncs is self.syncs and \
+           halo_scheme is self.halo_scheme:
+            return self
+
+        return self.__class__(exprs=exprs,
+                              ispace=ispace,
+                              guards=guards,
+                              properties=properties,
+                              syncs=syncs,
+                              halo_scheme=halo_scheme)
+
+    def subs(self, mapper, compact=()):
+        """
+        Build a new Cluster applying substitutions rules to `self`.
+        """
+        if not mapper:
+            return self
+
+        if self.halo_scheme:
+            raise NotImplementedError
+
+        key0 = lambda i: i.is_Block
+        subs0 = {d: self.ispace[d].promote(key0).dim for d in compact}
+
+        subs = {**mapper, **subs0}
+        exprs = [uxreplace(e, subs) for e in self.exprs]
+
+        ispace = self.ispace.switch(mapper)
+        key = lambda i: key0(i) and i in flatten(d._defines for d in subs0)
+        ispace = ispace.promote(key, mode='total')
+
+        guards = self.guards.subs(mapper).promote(subs0)
+        properties = self.properties.subs(mapper).promote(subs0)
+        syncs = self.syncs.subs(mapper)
+
+        return self.__class__(exprs=exprs, ispace=ispace, guards=guards,
+                              properties=properties, syncs=syncs)
+
+
 class ClusterGroup(tuple):
 
     """
@@ -551,6 +638,18 @@ class ClusterGroup(tuple):
                 obj._ispace = None
 
         return obj
+
+    def __eq__(self, other):
+        return (isinstance(other, ClusterGroup) and
+                super().__eq__(other) and
+                self._ispace == other._ispace)
+
+    def __ne__(self, other):
+        return not self == other
+
+    @cached_hash
+    def __hash__(self):
+        return hash((tuple(self), self._ispace))
 
     @classmethod
     def concatenate(cls, *cgroups):
@@ -591,7 +690,15 @@ class ClusterGroup(tuple):
         """Return the DataSpace of this ClusterGroup."""
         return DataSpace.union(*[i.dspace.reset() for i in self])
 
-    @property
+    @cached_property
+    def is_dense(self):
+        return all(i.is_dense for i in self)
+
+    @cached_property
+    def is_wild(self):
+        return all(i.is_wild for i in self)
+
+    @cached_property
     def is_halo_touch(self):
         return all(i.is_halo_touch for i in self)
 

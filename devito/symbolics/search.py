@@ -8,9 +8,10 @@ import sympy
 from devito.symbolics.queries import (
     q_derivative, q_dimension, q_function, q_indexed, q_leaf, q_symbol, q_terminal
 )
-from devito.tools import as_tuple
+from devito.tools import as_tuple, memoized_func, split
 
 __all__ = [
+    'retrieve_accesses',
     'retrieve_derivatives',
     'retrieve_dimensions',
     'retrieve_function_carriers',
@@ -140,10 +141,19 @@ def retrieve_indexed(exprs, mode='all', deep=False):
 
 def retrieve_functions(exprs, mode='all', deep=False):
     """Shorthand to retrieve the DiscreteFunctions in `exprs`."""
-    indexeds = search(exprs, q_indexed, mode, 'dfs', deep)
+    query = lambda i: q_function(i) or q_indexed(i)
+    found = search(exprs, query, 'all', 'dfs', deep)
 
-    functions = search(exprs, q_function, mode, 'dfs', deep)
-    functions.update({i.function for i in indexeds})
+    functions = modes[mode]()
+    indexed_functions = set()
+
+    for i in found:
+        if q_function(i):
+            functions.add(i) if mode == 'unique' else functions.append(i)
+        else:
+            indexed_functions.add(i.function)
+
+    functions.update(indexed_functions)
 
     return functions
 
@@ -175,6 +185,40 @@ def retrieve_function_carriers(exprs, mode='all'):
 def retrieve_terminals(exprs, mode='all', deep=False):
     """Shorthand to retrieve Indexeds and Symbols within ``exprs``."""
     return search(exprs, q_terminal, mode, 'dfs', deep)
+
+
+@memoized_func(scope='build')
+def retrieve_accesses(exprs, **kwargs):
+    """
+    Similar to `retrieve_terminals`, but with some adjustments:
+
+      * ComponentAccess's are retained, but the wrapped Indexed are discarded;
+      * TensorMove's are upcasted to the logical Indexed they represent.
+    """
+    from devito.types import ComponentAccess, Symbol, TensorMove  # noqa
+
+    from .manipulation import uxreplace  # noqa
+
+    kwargs['mode'] = 'unique'
+
+    compaccs = search(exprs, ComponentAccess)
+
+    if compaccs:
+        # Handle ComponentAccesses
+        subs = {i: Symbol(f'dummy{n}') for n, i in enumerate(compaccs)}
+        exprs1 = uxreplace(exprs, subs)
+        terms1 = retrieve_terminals(exprs1, **kwargs)
+
+        accesses = compaccs | terms1 - set(subs.values())
+    else:
+        accesses = retrieve_terminals(exprs, **kwargs)
+
+    # Handle TensorMoves
+    key = lambda i: isinstance(i, TensorMove)
+    tmovs, other = split(accesses, key)
+    accesses = {i.access for i in tmovs} | other
+
+    return accesses
 
 
 def retrieve_dimensions(exprs, mode='all', deep=False):

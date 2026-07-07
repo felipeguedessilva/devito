@@ -8,8 +8,8 @@ from sympy import Expr
 from devito.ir.support.utils import maximum, minimum
 from devito.ir.support.vector import Vector, vmax, vmin
 from devito.tools import (
-    Ordering, Stamp, as_list, as_set, as_tuple, filter_ordered, flatten, frozendict,
-    is_integer, toposort
+    CacheInstances, Ordering, Stamp, as_list, as_set, as_tuple, cached_hash,
+    filter_ordered, flatten, frozendict, is_integer, toposort
 )
 from devito.types import Dimension, ModuloDimension
 
@@ -53,6 +53,7 @@ class AbstractInterval:
 
     is_compatible = __eq__
 
+    @cached_hash
     def __hash__(self):
         return hash(self.dim.name)
 
@@ -88,7 +89,7 @@ class AbstractInterval:
     translate = negate
 
 
-class NullInterval(AbstractInterval):
+class NullInterval(AbstractInterval, CacheInstances):
 
     """
     A degenerate iterated closed interval on Z.
@@ -96,9 +97,14 @@ class NullInterval(AbstractInterval):
 
     is_Null = True
 
+    @classmethod
+    def _preprocess_args(cls, dim, stamp=S0):
+        return (dim, stamp), {}
+
     def __repr__(self):
         return f"{self.dim}[Null]{self.stamp}"
 
+    @cached_hash
     def __hash__(self):
         return hash(self.dim)
 
@@ -120,7 +126,7 @@ class NullInterval(AbstractInterval):
         return NullInterval(d, self.stamp)
 
 
-class Interval(AbstractInterval):
+class Interval(AbstractInterval, CacheInstances):
 
     """
     Interval(dim, lower, upper)
@@ -133,6 +139,18 @@ class Interval(AbstractInterval):
     """
 
     is_Defined = True
+
+    @classmethod
+    def _preprocess_args(cls, dim, lower=0, upper=0, stamp=S0):
+        try:
+            lower = int(lower)
+        except TypeError:
+            assert isinstance(lower, Expr)
+        try:
+            upper = int(upper)
+        except TypeError:
+            assert isinstance(upper, Expr)
+        return (dim, lower, upper, stamp), {}
 
     def __init__(self, dim, lower=0, upper=0, stamp=S0):
         super().__init__(dim, stamp)
@@ -151,6 +169,7 @@ class Interval(AbstractInterval):
     def __repr__(self):
         return f"{self.dim}[{self.lower},{self.upper}]{self.stamp}"
 
+    @cached_hash
     def __hash__(self):
         return hash((self.dim, self.offsets))
 
@@ -304,11 +323,17 @@ class Interval(AbstractInterval):
         )
 
 
-class IntervalGroup(Ordering):
+class IntervalGroup(Ordering, CacheInstances):
 
     """
     A sequence of Intervals equipped with set-like operations.
     """
+
+    @classmethod
+    def _preprocess_args(cls, items=None, relations=None, mode='total'):
+        items = as_tuple(items)
+        relations = tuple(tuple(i) for i in as_tuple(relations))
+        return (items,), {'relations': relations, 'mode': mode}
 
     @classmethod
     def reorder(cls, items, relations):
@@ -335,13 +360,14 @@ class IntervalGroup(Ordering):
             return super().simplify_relations(relations, items, mode)
 
     def __eq__(self, o):
-        return len(self) == len(o) and all(i == j for i, j in zip(self, o, strict=True))
+        return isinstance(o, IntervalGroup) and super().__eq__(o)
 
     def __contains__(self, d):
         return any(i.dim is d for i in self)
 
+    @cached_hash
     def __hash__(self):
-        return hash(tuple(self))
+        return hash((tuple(self), self.relations, self.mode))
 
     def __repr__(self):
         return "IntervalGroup[{}]".format(', '.join([repr(i) for i in self]))
@@ -478,7 +504,12 @@ class IntervalGroup(Ordering):
 
     def promote(self, cond, mode='unordered'):
         intervals = [i.promote(cond) for i in self]
-        intervals = IntervalGroup(intervals, relations=None, mode=mode)
+
+        if mode == 'total':
+            relations = [filter_ordered(i.dim for i in intervals)]
+        else:
+            relations = None
+        intervals = IntervalGroup(intervals, relations=relations, mode=mode)
 
         # There could be duplicate Dimensions at this point, so we sum up the
         # Intervals defined over the same Dimension to produce a well-defined
@@ -598,6 +629,7 @@ class IterationDirection:
     def __repr__(self):
         return self._name
 
+    @cached_hash
     def __hash__(self):
         return hash(self._name)
 
@@ -618,6 +650,11 @@ class IterationInterval(Interval):
     An Interval associated with metadata.
     """
 
+    @classmethod
+    def _preprocess_args(cls, interval, sub_iterators=(), direction=Forward):
+        sub_iterators = tuple(filter_ordered(as_tuple(sub_iterators)))
+        return (interval, sub_iterators, direction), {}
+
     def __init__(self, interval, sub_iterators=(), direction=Forward):
         super().__init__(interval.dim, *interval.offsets, stamp=interval.stamp)
         self.sub_iterators = sub_iterators
@@ -631,6 +668,7 @@ class IterationInterval(Interval):
             return False
         return self.direction is other.direction and super().__eq__(other)
 
+    @cached_hash
     def __hash__(self):
         return hash((self.dim, self.offsets, self.direction))
 
@@ -664,9 +702,6 @@ class Space:
 
     def __eq__(self, other):
         return isinstance(other, Space) and self.intervals == other.intervals
-
-    def __hash__(self):
-        return hash(self.intervals)
 
     def __len__(self):
         return len(self.intervals)
@@ -731,8 +766,9 @@ class DataSpace(Space):
                 self.intervals == other.intervals and
                 self.parts == other.parts)
 
+    @cached_hash
     def __hash__(self):
-        return hash((super().__hash__(), self.parts))
+        return hash((self.intervals, self.parts))
 
     @classmethod
     def union(cls, *others):
@@ -769,7 +805,7 @@ class DataSpace(Space):
         return DataSpace(intervals, parts)
 
 
-class IterationSpace(Space):
+class IterationSpace(Space, CacheInstances):
 
     """
     Represent an iteration space as a Space with additional metadata and operations.
@@ -785,23 +821,29 @@ class IterationSpace(Space):
         A mapper from Dimensions in ``intervals`` to IterationDirections.
     """
 
+    @classmethod
+    def _preprocess_args(cls, intervals, sub_iterators=None, directions=None):
+        if not isinstance(intervals, IntervalGroup):
+            intervals = IntervalGroup(as_tuple(intervals))
+
+        sub_iterators = sub_iterators or {}
+        sub_iterators = {d: tuple(filter_ordered(as_tuple(v)))
+                         for d, v in sub_iterators.items() if d in intervals}
+        sub_iterators.update({i.dim: () for i in intervals
+                              if i.dim not in sub_iterators})
+
+        directions = directions or {}
+        directions = {d: v for d, v in directions.items() if d in intervals}
+        directions.update({i.dim: Any for i in intervals
+                           if i.dim not in directions})
+
+        return (intervals, frozendict(sub_iterators), frozendict(directions)), {}
+
     def __init__(self, intervals, sub_iterators=None, directions=None):
         super().__init__(intervals)
 
-        # Normalize sub-iterators
-        sub_iterators = sub_iterators or {}
-        sub_iterators = {d: tuple(filter_ordered(as_tuple(v)))
-                         for d, v in sub_iterators.items() if d in self.intervals}
-        sub_iterators.update({i.dim: () for i in self.intervals
-                              if i.dim not in sub_iterators})
-        self._sub_iterators = frozendict(sub_iterators)
-
-        # Normalize directions
-        directions = directions or {}
-        directions = {d: v for d, v in directions.items() if d in self.intervals}
-        directions.update({i.dim: Any for i in self.intervals
-                           if i.dim not in directions})
-        self._directions = frozendict(directions)
+        self._sub_iterators = sub_iterators
+        self._directions = directions
 
     def __repr__(self):
         ret = ', '.join([f"{repr(i)}{repr(self.directions[i.dim])}"
@@ -822,8 +864,9 @@ class IterationSpace(Space):
         """
         return len(self.itintervals) < len(other.itintervals)
 
+    @cached_hash
     def __hash__(self):
-        return hash((super().__hash__(), self.sub_iterators, self.directions))
+        return hash((self.intervals, self.sub_iterators, self.directions))
 
     def __contains__(self, d):
         try:
@@ -899,16 +942,26 @@ class IterationSpace(Space):
 
         return IterationSpace(self.intervals, items, self.directions)
 
-    def switch(self, d0, d1, direction=None):
-        intervals = self.intervals.switch(d0, d1)
+    def switch(self, d0, d1=None, direction=None):
+        """
+        Construct a new IterationSpace in which the Dimension `d0` is replaced with
+        `d1`. Optionally, `d0` could be a mapper, in which case multiple Dimensions
+        may be switched.
+        """
+        mapper = d0 if isinstance(d0, dict) else {d0: d1}
 
+        intervals = self.intervals
         sub_iterators = dict(self.sub_iterators)
-        sub_iterators.pop(d0, None)
-        sub_iterators[d1] = ()
-
         directions = dict(self.directions)
-        v = directions.pop(d0, None)
-        directions[d1] = direction or v
+
+        for d0, d1 in mapper.items():
+            intervals = intervals.switch(d0, d1)
+
+            sub_iterators.pop(d0, None)
+            sub_iterators[d1] = ()
+
+            v = directions.pop(d0, None)
+            directions[d1] = direction or v
 
         return IterationSpace(intervals, sub_iterators, directions)
 
