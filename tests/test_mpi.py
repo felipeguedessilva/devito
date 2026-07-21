@@ -21,6 +21,7 @@ from devito.mpi import MPI
 from devito.mpi.distributed import CustomTopology
 from devito.mpi.routines import ComputeCall, HaloUpdateCall, HaloUpdateList, MPICall
 from devito.tools import Bunch
+from devito.types.dimension import ModuloDimension
 from examples.seismic.acoustic import acoustic_setup
 
 
@@ -2067,8 +2068,9 @@ class TestCodeGeneration:
         for n in FindNodes(Conditional).visit(op1):
             assert len(FindNodes(HaloUpdateCall).visit(n)) == 0
 
+    @pytest.mark.parametrize('dtype', [np.float32, np.complex64])
     @pytest.mark.parallel(mode=2)
-    def test_allreduce_time(self, mode):
+    def test_allreduce_time(self, dtype, mode):
         space_order = 8
         nx, ny = 11, 11
 
@@ -2076,10 +2078,14 @@ class TestCodeGeneration:
         tt = grid.time_dim
         nt = 10
 
-        ux = TimeFunction(name="ux", grid=grid, time_order=1, space_order=space_order)
-        g = TimeFunction(name="g", grid=grid, dimensions=(tt, ), shape=(nt,))
+        c = tt if dtype == np.float32 else tt + tt * 1j
 
-        op = Operator([Eq(ux.forward, ux + tt), Inc(g, ux)], name="Op")
+        ux = TimeFunction(name="ux", grid=grid, time_order=1, space_order=space_order,
+                          dtype=dtype)
+        g = TimeFunction(name="g", grid=grid, dimensions=(tt, ), shape=(nt,),
+                         dtype=dtype)
+
+        op = Operator([Eq(ux.forward, ux + c), Inc(g, ux)], name="Op")
         assert_structure(op, ['t,x,y', 't'], 'txy')
 
         # Reduce should be in time loop but not in space loop
@@ -2091,7 +2097,10 @@ class TestCodeGeneration:
                 assert len(FindNodes(Call).visit(i)) == 0
 
         op.apply(time_m=0, time_M=nt-1)
-        assert np.isclose(np.max(g.data), 4356.0)
+        if dtype == np.float32:
+            assert np.isclose(np.max(g.data), 4356.0)
+        else:
+            assert np.isclose(np.max(g.data), 4356.0 + 4356.0j)
 
     @pytest.mark.parallel(mode=2)
     def test_multi_allreduce_time(self, mode):
@@ -2233,6 +2242,38 @@ class TestCodeGeneration:
         tloop = get_time_loop(op)
         halo_update = tloop.nodes[0].body[0].body[0].body[0]
         assert isinstance(halo_update, HaloUpdateList)
+
+    @pytest.mark.parallel(mode=4)
+    def test_ensure_halo_updates_within_seq_loops(self, mode):
+        n = 30
+        grid = Grid(shape=(n, n))
+
+        x, y = grid.dimensions
+        d = Dimension(name="d")
+
+        a = Function(name="a", grid=grid, space_order=8)
+        b = a.func(name='b')
+
+        g = Function(name="g", grid=grid, space_order=8, dimensions=(x, y, d),
+                     shape=(n, n, 2))
+        h = g.func(name='h')
+
+        eqns = [Eq(a, 0.0),
+                Eq(h, b * g),
+                Inc(a, b * (h.dx + h.dy))]
+
+        op = Operator(eqns, opt=('advanced', {'openmp': True}))
+        _ = op.cfunction
+
+        # Check generated code -- expected one halo exchange within a sequential
+        # `d` loop
+        assert_structure(op, ['x,y', 'x,y,d', 'd', 'x,y,d'], 'xyddxyd')
+        iters = FindNodes(Iteration).visit(op)
+        assert iters[2].dim is d and iters[2].is_Parallel
+        assert iters[3].dim is d and iters[3].is_Sequential
+
+        # Probably unnecessary, but ensures there's no hanging
+        op.apply()
 
     @pytest.mark.parallel(mode=4)
     def test_halo_inner_dim(self, mode):
@@ -3249,8 +3290,9 @@ class TestOperatorAdvanced:
 
         calls, _ = check_halo_exchanges(op, 2, 1)
         args = calls[0].arguments
-        assert args[-2].name == 't2'
-        assert args[-2].origin == t + 1
+        t2 = next(filter(lambda a: isinstance(a, ModuloDimension), args))
+        assert t2.name == 't2'
+        assert t2.origin == t + 1
 
 
 def gen_serial_norms(shape, so):
